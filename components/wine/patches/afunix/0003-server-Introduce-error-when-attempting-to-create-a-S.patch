@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ally Sommers <dropbear.sh@gmail.com>
+Date: Tue, 16 May 2023 02:20:55 -0700
+Subject: [PATCH] server: Introduce error when attempting to create a
+ SOCK_DGRAM AF_UNIX socket.
+
+Origin: https://gitlab.winehq.org/wine/wine/-/merge_requests/7650 (head 30718c3ce0c1)
+Topic: afunix
+---
+ server/sock.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/server/sock.c b/server/sock.c
+index 528ec612665b38cd3eb469ce475e007b421ba000..1137764f28912bc614849ff2760c1fe032619940 100644
+--- a/server/sock.c
++++ b/server/sock.c
+@@ -1936,6 +1936,12 @@ static int init_socket( struct sock *sock, int family, int type, int protocol )
+         return -1;
+     }
+ 
++    if (unix_family == AF_UNIX && unix_type == SOCK_DGRAM)
++    {
++        set_win32_error(WSAEAFNOSUPPORT);
++        return -1;
++    }
++
+     sockfd = socket( unix_family, unix_type, unix_protocol );
+ #ifdef linux
+     if (sockfd == -1 && errno == EPERM && unix_type == SOCK_RAW

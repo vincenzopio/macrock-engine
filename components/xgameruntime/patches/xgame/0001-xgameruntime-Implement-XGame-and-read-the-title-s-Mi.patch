@@ -1,0 +1,464 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:45:07 +0200
+Subject: [PATCH] xgameruntime: Implement XGame and read the title's
+ MicrosoftGame.config.
+
+GameConfig reads the configuration once, from InitializeApiImplEx2(): inline or from the path in
+the initialization options, or else the first MicrosoftGame.config beside the executable or in a
+parent directory. It keeps the title id (hexadecimal), the MSA app id and MSA full trust. A
+missing or invalid configuration does not fail initialization; XGameGetXboxTitleId() returns the
+error. XLaunchNewGame() and XLaunchRestartOnCrash() remain stubs. The tests use a
+MicrosoftGame.config beside the test executable.
+
+Ported from WineGDK (LGPL-2.1-or-later); changes are original work for macrock.
+
+Topic: xgame
+---
+ src/CMakeLists.txt          |   2 +
+ src/System/GameConfig.cpp   | 125 ++++++++++++++++++++++++++++++++++++
+ src/System/GameConfig.h     |  43 +++++++++++++
+ src/System/XGame.cpp        |  95 +++++++++++++++++++++++++++
+ src/main.cpp                |   7 ++
+ src/private.h               |   2 +
+ tests/CMakeLists.txt        |   7 ++
+ tests/MicrosoftGame.config  |   7 ++
+ tests/System/test_xgame.cpp |  47 ++++++++++++++
+ 9 files changed, 335 insertions(+)
+ create mode 100644 src/System/GameConfig.cpp
+ create mode 100644 src/System/GameConfig.h
+ create mode 100644 src/System/XGame.cpp
+ create mode 100644 tests/MicrosoftGame.config
+ create mode 100644 tests/System/test_xgame.cpp
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 76b7ad22c855a33bbd05df6fd3d35d7a2e490b4b..3285c1d581f7423897602103b4e21f6c7130fa48 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -19,6 +19,8 @@ target_sources(xgameruntime PRIVATE
+ 
+ # System
+ target_sources(xgameruntime PRIVATE
++        System/GameConfig.cpp
++        System/XGame.cpp
+         System/XThreading.cpp )
+ 
+ # System/Threading (based on libHttpClient)
+diff --git a/src/System/GameConfig.cpp b/src/System/GameConfig.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1fbec2b026ef0514762a1b781e73d2bf7110ea41
+--- /dev/null
++++ b/src/System/GameConfig.cpp
+@@ -0,0 +1,125 @@
++/*
++ * Xbox Game runtime Library
++ *  GDK Component: the title's MicrosoftGame.config
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "GameConfig.h"
++
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++
++#include <libxml/parser.h>
++#include <libxml/tree.h>
++
++static GameConfig config;
++static std::once_flag configOnce;
++
++/* The first MicrosoftGame.config beside the executable or in a parent directory. */
++static HRESULT FindConfig( char *path, DWORD size )
++{
++    static const char name[] = "MicrosoftGame.config";
++    char *last;
++    DWORD length = GetModuleFileNameA( nullptr, path, size );
++
++    if ( !length || length >= size ) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++
++    while ( ( last = strrchr( path, '\\' ) ) )
++    {
++        last[1] = '\0';
++        if ( strlen( path ) + sizeof(name) > size ) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++        strcat( path, name );
++        if ( GetFileAttributesA( path ) != INVALID_FILE_ATTRIBUTES ) return S_OK;
++        *last = '\0';
++    }
++    return E_GAME_MISSING_GAME_CONFIG;
++}
++
++static HRESULT ParseConfig( xmlDocPtr doc )
++{
++    xmlNodePtr root = xmlDocGetRootElement( doc ), child;
++
++    if ( !root || strcmp( (const char *)root->name, "Game" ) ) return E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
++
++    for ( child = root->children; child; child = child->next )
++    {
++        char *value, *end;
++
++        if ( child->type != XML_ELEMENT_NODE ) continue;
++        if ( !( value = (char *)xmlNodeGetContent( child ) ) ) continue;
++
++        if ( !strcmp( (const char *)child->name, "TitleId" ) )
++        {
++            unsigned long id = strtoul( value, &end, 16 );
++            if ( end == value || *end || id > 0xffffffffUL )
++            {
++                xmlFree( value );
++                return E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
++            }
++            config.titleId = (UINT32)id;
++        }
++        else if ( !strcmp( (const char *)child->name, "MSAAppId" ) )
++            lstrcpynA( config.msaAppId, value, sizeof(config.msaAppId) );
++        else if ( !strcmp( (const char *)child->name, "MSAFullTrust" ) )
++            config.msaFullTrust = !strcmp( value, "true" );
++
++        xmlFree( value );
++    }
++    return S_OK;
++}
++
++static HRESULT ReadConfig( const INITIALIZE_OPTIONS *options )
++{
++    char path[MAX_PATH];
++    xmlDocPtr doc;
++    HRESULT hr;
++
++    if ( options && options->gameConfig && options->isInlineConfig )
++        doc = xmlReadMemory( options->gameConfig, (int)strlen( options->gameConfig ), nullptr, nullptr, XML_PARSE_NONET );
++    else if ( options && options->gameConfig )
++        doc = xmlReadFile( options->gameConfig, nullptr, XML_PARSE_NONET );
++    else
++    {
++        if ( FAILED( hr = FindConfig( path, sizeof(path) ) ) ) return hr;
++        doc = xmlReadFile( path, nullptr, XML_PARSE_NONET );
++    }
++    if ( !doc ) return E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
++
++    hr = ParseConfig( doc );
++    xmlFreeDoc( doc );
++    return hr;
++}
++
++HRESULT LoadGameConfig( const INITIALIZE_OPTIONS *options )
++{
++    std::call_once( configOnce, [options]
++    {
++        config.status = ReadConfig( options );
++        if ( SUCCEEDED( config.status ) )
++            TRACE( "title id %#x, MSA full trust %d.\n", config.titleId, config.msaFullTrust );
++        else
++            WARN( "cannot read MicrosoftGame.config, hr %#lx.\n", config.status );
++    } );
++    return config.status;
++}
++
++const GameConfig &GetGameConfig()
++{
++    return config;
++}
+diff --git a/src/System/GameConfig.h b/src/System/GameConfig.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f8802ae3bb1be6b443f84d43f56767e49a6944c
+--- /dev/null
++++ b/src/System/GameConfig.h
+@@ -0,0 +1,43 @@
++/*
++ * Xbox Game runtime Library
++ *  GDK Component: the title's MicrosoftGame.config
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __XGAMERUNTIME_GAMECONFIG_H__
++#define __XGAMERUNTIME_GAMECONFIG_H__
++
++#include "../private.h"
++
++/* What the runtime needs from the title's MicrosoftGame.config. */
++struct GameConfig
++{
++    HRESULT status = E_GAMERUNTIME_NOT_INITIALIZED; /* S_OK once read; why it could not be otherwise */
++    UINT32 titleId = 0;                             /* <TitleId>, hexadecimal in the file */
++    char msaAppId[64] = "";                         /* <MSAAppId> */
++    BOOLEAN msaFullTrust = FALSE;                   /* <MSAFullTrust> */
++};
++
++/* Read the configuration once: inline or from the path in options, or else the first
++ * MicrosoftGame.config found beside the executable or in a parent directory. Later calls return
++ * the status of the first one. */
++HRESULT LoadGameConfig( const INITIALIZE_OPTIONS *options );
++
++const GameConfig &GetGameConfig();
++
++#endif
+diff --git a/src/System/XGame.cpp b/src/System/XGame.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..bebcad7d02b6fdccdbf524268c94025366629106
+--- /dev/null
++++ b/src/System/XGame.cpp
+@@ -0,0 +1,95 @@
++/*
++ * Xbox Game runtime Library
++ *  GDK Component: System API -> XGame
++ *
++ * Ported from WineGDK's dlls/xgameruntime/GDKComponent/System/XGame.c (LGPL-2.1-or-later);
++ * the title id now comes from GameConfig, read as the hexadecimal number it is.
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "../private.h"
++#include "GameConfig.h"
++
++#include <atomic>
++
++class XGameImpl :
++    public IXGameImpl3
++{
++public:
++    HRESULT WINAPI QueryInterface( REFIID iid, void **out ) noexcept override
++    {
++        TRACE( "iface %p, iid %s, out %p.\n", this, debugstr_guid( &iid ), out );
++
++        if ( !out ) return E_POINTER;
++        *out = nullptr;
++
++        if ( iid == __uuidof( IUnknown ) ||
++             iid == __uuidof( IXGameImpl ) ||
++             iid == __uuidof( IXGameImpl2 ) ||
++             iid == __uuidof( IXGameImpl3 ) )
++        {
++            AddRef();
++            *out = static_cast<IXGameImpl3 *>(this);
++            return S_OK;
++        }
++
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &iid ) );
++        return E_NOINTERFACE;
++    }
++
++    ULONG WINAPI AddRef() noexcept override
++    {
++        return static_cast<ULONG>(++ref);
++    }
++
++    ULONG WINAPI Release() noexcept override
++    {
++        // A static object: never deleted.
++        return static_cast<ULONG>(--ref);
++    }
++
++    HRESULT WINAPI XGameGetXboxTitleId( UINT32 *titleId ) override
++    {
++        const GameConfig &config = GetGameConfig();
++
++        TRACE( "titleId %p.\n", titleId );
++
++        if ( !titleId ) return E_POINTER;
++        if ( FAILED( config.status ) ) return config.status;
++        *titleId = config.titleId;
++        return S_OK;
++    }
++
++    void WINAPI XLaunchNewGame( const char *exePath, const char *args, XUserHandle defaultUser ) override
++    {
++        FIXME( "exePath %s, args %s, defaultUser %p stub!\n", exePath ? exePath : "(null)", args ? args : "(null)",
++               defaultUser );
++    }
++
++    HRESULT WINAPI XLaunchRestartOnCrash( const char *args, UINT32 reserved ) override
++    {
++        FIXME( "args %s, reserved %u stub!\n", args ? args : "(null)", reserved );
++        return E_NOTIMPL;
++    }
++
++private:
++    std::atomic_long ref{ 1 };
++};
++
++static XGameImpl g_x_game;
++
++IXGameImpl3 *x_game = static_cast<IXGameImpl3 *>(&g_x_game);
+diff --git a/src/main.cpp b/src/main.cpp
+index 84f40f462ecaaf03893556189e9d0d6e918c482a..86e2b185b6ec60a5c5cbc75d3bbb7aeb41ab1aec 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -20,6 +20,7 @@
+ 
+ #include <initguid.h>
+ #include "private.h"
++#include "System/GameConfig.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -67,6 +68,10 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, char mode, const
+     if ( !mtaCookie && FAILED( status = CoIncrementMTAUsage( &mtaCookie ) ) )
+         ERR( "CoIncrementMTAUsage failed, hr %#lx.\n", status );
+ 
++    /* A missing or unreadable configuration does not fail initialization; the APIs that need it
++     * (XGameGetXboxTitleId, sign-in) report it. */
++    LoadGameConfig( options );
++
+     if ( !socketInitialized )
+     {
+         if ( SUCCEEDED( status = xodus_ipclayer->InitializeSocket() ) )
+@@ -120,6 +125,8 @@ HRESULT WINAPI QueryApiImpl( REFCLSID clsid, REFIID iid, void **out )
+     {
+         return x_threading_impl->QueryInterface( iid, out );
+     }
++    if ( IsEqualGUID( clsid, CLSID_XGameImpl ) )
++        return x_game->QueryInterface( iid, out );
+ 
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &clsid ) );
+     return E_NOINTERFACE;
+diff --git a/src/private.h b/src/private.h
+index f836f74627ec985b076c1fe00fa382f80b867003..c2e19354fc31a1b932ad83da9e89d39bb36f8ce0 100644
+--- a/src/private.h
++++ b/src/private.h
+@@ -49,6 +49,7 @@
+ #include <xsystem.h>
+ #include <xgameruntimeinit.h>
+ #include <xgameruntimefeature.h>
++#include <xgame.h>
+ #include <xnetworking.h>
+ #include <xuser.h>
+ #include <xasync.h>
+@@ -73,6 +74,7 @@
+ #define E_ILLEGAL_METHOD_CALL                              _HRESULT_TYPEDEF_(0x8000000E)
+ 
+ extern IXThreadingImpl *x_threading_impl;
++extern IXGameImpl3 *x_game;
+ extern IActivationFactory* xodus_ipc_packet_factory;
+ 
+ #ifdef __cplusplus
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 7917fa62b7be9f4e89d5dd24622ea6a4bfd570b3..8675557ebe302cf0901d716abf36c8b50cbc9bf6 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1,7 +1,14 @@
+ add_executable(test_xgameruntime
++        System/test_xgame.cpp
+         System/test_xthreading.cpp
+         test_fixtures.cpp)
+ 
++# The runtime reads MicrosoftGame.config from beside the executable.
++add_custom_command(TARGET test_xgameruntime POST_BUILD
++        COMMAND ${CMAKE_COMMAND} -E copy_if_different
++        ${CMAKE_CURRENT_SOURCE_DIR}/MicrosoftGame.config
++        $<TARGET_FILE_DIR:test_xgameruntime>/MicrosoftGame.config )
++
+ target_link_libraries(test_xgameruntime
+         PRIVATE
+         libxgameruntime
+diff --git a/tests/MicrosoftGame.config b/tests/MicrosoftGame.config
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8d398a1822ccd84a02f262e8bd0209bd939c5fb
+--- /dev/null
++++ b/tests/MicrosoftGame.config
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Configuration of the test executable; the values are only checked by the tests. -->
++<Game configVersion="1">
++  <TitleId>1A2B3C4D</TitleId>
++  <MSAAppId>0000000012345678</MSAAppId>
++  <MSAFullTrust>true</MSAFullTrust>
++</Game>
+diff --git a/tests/System/test_xgame.cpp b/tests/System/test_xgame.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b46d9bc04fde3621908f63d628004e3219c0fd81
+--- /dev/null
++++ b/tests/System/test_xgame.cpp
+@@ -0,0 +1,47 @@
++/*
++ * Tests for XGame and the game configuration
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "../test_fixtures.h"
++
++#include <windows.h>
++#include <xgame.h>
++
++class XGameTests : public XGameRuntimeTests
++{
++};
++
++TEST_F(XGameTests, TitleIdComesFromTheConfigAsHexadecimal)
++{
++    UINT32 titleId = 0;
++
++    // tests/MicrosoftGame.config has <TitleId>1A2B3C4D</TitleId>.
++    EXPECT_HRESULT_SUCCEEDED(XGameGetXboxTitleId(&titleId));
++    EXPECT_EQ(titleId, 0x1A2B3C4Du);
++}
++
++TEST_F(XGameTests, TitleIdNeedsAPointer)
++{
++    EXPECT_EQ(XGameGetXboxTitleId(nullptr), E_POINTER);
++}
++
++TEST_F(XGameTests, RestartOnCrashIsNotImplemented)
++{
++    EXPECT_EQ(XLaunchRestartOnCrash(nullptr, 0), E_NOTIMPL);
++}

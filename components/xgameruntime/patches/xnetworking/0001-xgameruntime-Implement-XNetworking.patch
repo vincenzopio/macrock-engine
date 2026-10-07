@@ -1,0 +1,516 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:56:33 +0200
+Subject: [PATCH] xgameruntime: Implement XNetworking.
+
+Changes from WineGDK's implementation:
+- The object implements IXNetworkingImpl2, which titles ask for.
+- Security information for a URL reports TLS 1.2 and 1.3 and no certificate thumbprints, so
+  XNetworkingVerifyServerCertificate() has no pinning to check and succeeds; WinHTTP verifies the
+  chain, the dates and the host name when it connects.
+- XNetworkingRegisterConnectivityHintChanged() returns a token and delivers one notification on
+  the given queue (or the process queue); unregistering before delivery cancels it.
+- The connectivity hint is a desktop with unrestricted internet access; the UDP port,
+  configuration and statistics functions remain stubs.
+
+Ported from WineGDK (LGPL-2.1-or-later); changes are original work for macrock.
+
+Topic: xnetworking
+---
+ src/CMakeLists.txt                |   1 +
+ src/System/XNetworking.cpp        | 295 ++++++++++++++++++++++++++++++
+ src/main.cpp                      |   2 +
+ src/private.h                     |   1 +
+ tests/CMakeLists.txt              |   1 +
+ tests/System/test_xnetworking.cpp | 131 +++++++++++++
+ 6 files changed, 431 insertions(+)
+ create mode 100644 src/System/XNetworking.cpp
+ create mode 100644 tests/System/test_xnetworking.cpp
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 8f8df77ff013472f1337cc37d00c909d86e45af6..f10a9163abeb73fe8397d9b5305a10dbc9b5875d 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -23,6 +23,7 @@ target_sources(xgameruntime PRIVATE
+         System/XError.cpp
+         System/XGame.cpp
+         System/XGameRuntimeFeature.cpp
++        System/XNetworking.cpp
+         System/XSystem.cpp
+         System/XThreading.cpp )
+ 
+diff --git a/src/System/XNetworking.cpp b/src/System/XNetworking.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..15e336a50a1c4655995507f60b6de8ac5b55b537
+--- /dev/null
++++ b/src/System/XNetworking.cpp
+@@ -0,0 +1,295 @@
++/*
++ * Xbox Game runtime Library
++ *  GDK Component: System API -> XNetworking
++ *
++ * Ported from WineGDK's dlls/xgameruntime/GDKComponent/System/XNetworking.cpp
++ * (LGPL-2.1-or-later). Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "../private.h"
++
++#include <winhttp.h>
++#include <atomic>
++#include <map>
++#include <mutex>
++
++/* What a Windows desktop with a working connection reports; there is no change notification
++ * from the host, so this never changes. */
++static void FillConnectivityHint( XNetworkingConnectivityHint *hint )
++{
++    *hint = XNetworkingConnectivityHint{};
++    hint->connectivityLevel = XNetworkingConnectivityLevelHint::InternetAccess;
++    hint->connectivityCost = XNetworkingConnectivityCostHint::Unrestricted;
++    hint->networkInitialized = TRUE;
++}
++
++/* Connectivity hint registrations, by token. */
++struct HintRegistration
++{
++    void *context;
++    XNetworkingConnectivityHintChangedCallback *callback;
++};
++static std::mutex hintLock;
++static std::map<UINT64, HintRegistration> hintRegistrations;
++static UINT64 nextHintToken = 1;
++
++static void CALLBACK NotifyConnectivityHint( void *context, BOOLEAN canceled )
++{
++    UINT64 token = reinterpret_cast<UINT64>(context);
++    XNetworkingConnectivityHint hint;
++    HintRegistration registration;
++
++    if ( canceled ) return;
++    {
++        const std::lock_guard<std::mutex> lock( hintLock );
++        auto found = hintRegistrations.find( token );
++        if ( found == hintRegistrations.end() ) return; /* unregistered meanwhile */
++        registration = found->second;
++    }
++    FillConnectivityHint( &hint );
++    registration.callback( registration.context, &hint );
++}
++
++static const char securityInformationIdentity[] = "XNetworkingQuerySecurityInformationForUrlAsync";
++
++static HRESULT CALLBACK SecurityInformationProvider( XAsyncOp op, const XAsyncProviderData *data )
++{
++    switch ( op )
++    {
++        case XAsyncOp::Begin:
++            return XAsyncSchedule( data->async, 0 );
++
++        case XAsyncOp::DoWork:
++            XAsyncComplete( data->async, S_OK, sizeof(XNetworkingSecurityInformation) );
++            return S_OK;
++
++        case XAsyncOp::GetResult:
++        {
++            auto *information = static_cast<XNetworkingSecurityInformation *>(data->buffer);
++            /* The protocols a current Windows enables; no certificate pinning (thumbprints). */
++            information->enabledHttpSecurityProtocolFlags = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 |
++                                                            WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
++            information->thumbprintCount = 0;
++            information->thumbprints = nullptr;
++            return S_OK;
++        }
++
++        default:
++            return S_OK;
++    }
++}
++
++static HRESULT SecurityInformationResult( XAsyncBlock *asyncBlock, SIZE_T bufferSize, SIZE_T *bufferUsed,
++                                          UINT8 *buffer, XNetworkingSecurityInformation **information )
++{
++    HRESULT hr;
++
++    if ( !asyncBlock || !buffer || !information ) return E_POINTER;
++    if ( SUCCEEDED( hr = XAsyncGetResult( asyncBlock, securityInformationIdentity, bufferSize, buffer, bufferUsed ) ) )
++        *information = reinterpret_cast<XNetworkingSecurityInformation *>(buffer);
++    return hr;
++}
++
++class XNetworkingImpl :
++    public IXNetworkingImpl2
++{
++public:
++    HRESULT WINAPI QueryInterface( REFIID iid, void **out ) noexcept override
++    {
++        if ( !out ) return E_POINTER;
++        *out = nullptr;
++
++        if ( iid == __uuidof( IUnknown ) ||
++             iid == __uuidof( IXNetworkingImpl ) ||
++             iid == __uuidof( IXNetworkingImpl2 ) )
++        {
++            AddRef();
++            *out = static_cast<IXNetworkingImpl2 *>(this);
++            return S_OK;
++        }
++
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &iid ) );
++        return E_NOINTERFACE;
++    }
++
++    ULONG WINAPI AddRef() noexcept override
++    {
++        return static_cast<ULONG>(++ref);
++    }
++
++    ULONG WINAPI Release() noexcept override
++    {
++        // A static object: never deleted.
++        return static_cast<ULONG>(--ref);
++    }
++
++    HRESULT WINAPI XNetworkingQueryPreferredLocalUdpMultiplayerPort( UINT16 *preferredLocalUdpMultiplayerPort ) override
++    {
++        FIXME( "preferredLocalUdpMultiplayerPort %p stub!\n", preferredLocalUdpMultiplayerPort );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync( XAsyncBlock *asyncBlock ) override
++    {
++        FIXME( "asyncBlock %p stub!\n", asyncBlock );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult( XAsyncBlock *asyncBlock,
++                                                                                UINT16 *preferredLocalUdpMultiplayerPort ) override
++    {
++        FIXME( "asyncBlock %p, preferredLocalUdpMultiplayerPort %p stub!\n", asyncBlock, preferredLocalUdpMultiplayerPort );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged( XTaskQueueHandle queue, void *context,
++            XNetworkingPreferredLocalUdpMultiplayerPortChangedCallback *callback, XTaskQueueRegistrationToken *token ) override
++    {
++        FIXME( "queue %p, context %p, callback %p, token %p stub!\n", queue, context, callback, token );
++        return E_NOTIMPL;
++    }
++
++    BOOLEAN WINAPI XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged( XTaskQueueRegistrationToken token,
++                                                                                 BOOLEAN wait ) override
++    {
++        FIXME( "token %llu, wait %d stub!\n", (unsigned long long)token.token, wait );
++        return FALSE;
++    }
++
++    HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlAsync( const char *url, XAsyncBlock *asyncBlock ) override
++    {
++        TRACE( "asyncBlock %p.\n", asyncBlock );
++        if ( !url || !asyncBlock ) return E_POINTER;
++        return XAsyncBegin( asyncBlock, nullptr, securityInformationIdentity, securityInformationIdentity,
++                            SecurityInformationProvider );
++    }
++
++    HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlAsyncResultSize( XAsyncBlock *asyncBlock,
++                                                                             SIZE_T *bufferByteCount ) override
++    {
++        if ( !asyncBlock || !bufferByteCount ) return E_POINTER;
++        return XAsyncGetResultSize( asyncBlock, bufferByteCount );
++    }
++
++    HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlAsyncResult( XAsyncBlock *asyncBlock, SIZE_T bufferByteCount,
++            SIZE_T *bufferByteCountUsed, UINT8 *buffer, XNetworkingSecurityInformation **securityInformation ) override
++    {
++        return SecurityInformationResult( asyncBlock, bufferByteCount, bufferByteCountUsed, buffer, securityInformation );
++    }
++
++    HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlUtf16Async( const WCHAR *url, XAsyncBlock *asyncBlock ) override
++    {
++        TRACE( "url %p, asyncBlock %p.\n", url, asyncBlock );
++        if ( !url || !asyncBlock ) return E_POINTER;
++        return XAsyncBegin( asyncBlock, nullptr, securityInformationIdentity, securityInformationIdentity,
++                            SecurityInformationProvider );
++    }
++
++    HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize( XAsyncBlock *asyncBlock,
++                                                                                  SIZE_T *bufferByteCount ) override
++    {
++        return XNetworkingQuerySecurityInformationForUrlAsyncResultSize( asyncBlock, bufferByteCount );
++    }
++
++    HRESULT WINAPI XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult( XAsyncBlock *asyncBlock,
++            SIZE_T bufferByteCount, SIZE_T *bufferByteCountUsed, UINT8 *buffer,
++            XNetworkingSecurityInformation **securityInformation ) override
++    {
++        return SecurityInformationResult( asyncBlock, bufferByteCount, bufferByteCountUsed, buffer, securityInformation );
++    }
++
++    /* Pinning only: no thumbprints are reported, and WinHTTP verified the chain, the dates and the
++     * host name when it connected. */
++    HRESULT WINAPI XNetworkingVerifyServerCertificate( void *requestHandle,
++                                                      const XNetworkingSecurityInformation *securityInformation ) override
++    {
++        if ( !requestHandle || !securityInformation ) return E_POINTER;
++        if ( securityInformation->thumbprintCount )
++            FIXME( "%Iu certificate thumbprints not checked (pinning is not implemented).\n",
++                   securityInformation->thumbprintCount );
++        return S_OK;
++    }
++
++    HRESULT WINAPI XNetworkingGetConnectivityHint( XNetworkingConnectivityHint *connectivityHint ) override
++    {
++        TRACE( "connectivityHint %p.\n", connectivityHint );
++        if ( !connectivityHint ) return E_POINTER;
++        FillConnectivityHint( connectivityHint );
++        return S_OK;
++    }
++
++    /* The hint never changes, so the callback runs once, soon after registration, on the given
++     * queue (or the process queue). */
++    HRESULT WINAPI XNetworkingRegisterConnectivityHintChanged( XTaskQueueHandle queue, void *context,
++            XNetworkingConnectivityHintChangedCallback *callback, XTaskQueueRegistrationToken *token ) override
++    {
++        XTaskQueueHandle processQueue = nullptr;
++        UINT64 id;
++        HRESULT hr;
++
++        TRACE( "queue %p, context %p, callback %p, token %p.\n", queue, context, callback, token );
++        if ( !callback || !token ) return E_POINTER;
++        {
++            const std::lock_guard<std::mutex> lock( hintLock );
++            id = nextHintToken++;
++            hintRegistrations[id] = HintRegistration{ context, callback };
++        }
++        token->token = id;
++
++        if ( !queue && XTaskQueueGetCurrentProcessTaskQueue( &processQueue ) ) queue = processQueue;
++        if ( queue )
++        {
++            if ( FAILED( hr = XTaskQueueSubmitCallback( queue, XTaskQueuePort::Completion, reinterpret_cast<void *>(id),
++                                                        NotifyConnectivityHint ) ) )
++                WARN( "cannot queue the first connectivity hint, hr %#lx.\n", hr );
++        }
++        if ( processQueue ) XTaskQueueCloseHandle( processQueue );
++        return S_OK;
++    }
++
++    BOOLEAN WINAPI XNetworkingUnregisterConnectivityHintChanged( XTaskQueueRegistrationToken token, BOOLEAN wait ) override
++    {
++        TRACE( "token %llu, wait %d.\n", (unsigned long long)token.token, wait );
++        const std::lock_guard<std::mutex> lock( hintLock );
++        return hintRegistrations.erase( token.token ) != 0;
++    }
++
++    HRESULT WINAPI XNetworkingQueryConfigurationSetting( XNetworkingConfigurationSetting setting, UINT64 *value ) override
++    {
++        FIXME( "setting %u, value %p stub!\n", static_cast<UINT32>(setting), value );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XNetworkingSetConfigurationSetting( XNetworkingConfigurationSetting setting, UINT64 value ) override
++    {
++        FIXME( "setting %u, value %llu stub!\n", static_cast<UINT32>(setting), (unsigned long long)value );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XNetworkingQueryStatistics( XNetworkingStatisticsType type, XNetworkingStatisticsBuffer *buffer ) override
++    {
++        FIXME( "type %u, buffer %p stub!\n", static_cast<UINT32>(type), buffer );
++        return E_NOTIMPL;
++    }
++
++private:
++    std::atomic_long ref{ 1 };
++};
++
++static XNetworkingImpl g_x_networking;
++
++IXNetworkingImpl2 *x_networking = static_cast<IXNetworkingImpl2 *>(&g_x_networking);
+diff --git a/src/main.cpp b/src/main.cpp
+index d5382ffe67c89d0a9a41dbbf02766d48615584bd..c562535877d5b4fda2721a31841f60a65a6bf877 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -136,6 +136,8 @@ HRESULT WINAPI QueryApiImpl( REFCLSID clsid, REFIID iid, void **out )
+         return x_system_analytics->QueryInterface( iid, out );
+     if ( IsEqualGUID( clsid, CLSID_XErrorImpl ) )
+         return x_error->QueryInterface( iid, out );
++    if ( IsEqualGUID( clsid, CLSID_XNetworkingImpl ) )
++        return x_networking->QueryInterface( iid, out );
+ 
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &clsid ) );
+     return E_NOINTERFACE;
+diff --git a/src/private.h b/src/private.h
+index 89e692ff6a8acc067c3a1c3c61863c5417e696cf..0207461cb1b883624d4756581ca5e3e5645adbeb 100644
+--- a/src/private.h
++++ b/src/private.h
+@@ -80,6 +80,7 @@ extern IXGameRuntimeFeatureImpl *x_game_runtime_feature;
+ extern IXSystemImpl5 *x_system;
+ extern IXSystemAnalyticsImpl *x_system_analytics;
+ extern IXErrorImpl *x_error;
++extern IXNetworkingImpl2 *x_networking;
+ 
+ #ifdef __cplusplus
+ /* Pass an error to the title's XErrorSetCallback() callback and options. */
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 962dd0a56954712901bbb041489e4fa64c703464..9511cc192cb7c68bec778691f56860126ee5c9d8 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -2,6 +2,7 @@ add_executable(test_xgameruntime
+         System/test_xerror.cpp
+         System/test_xgame.cpp
+         System/test_xgameruntimefeature.cpp
++        System/test_xnetworking.cpp
+         System/test_xsystem.cpp
+         System/test_xthreading.cpp
+         test_fixtures.cpp)
+diff --git a/tests/System/test_xnetworking.cpp b/tests/System/test_xnetworking.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6a76eb2da0ae541ff579b5fd36ea398f00ccf0bf
+--- /dev/null
++++ b/tests/System/test_xnetworking.cpp
+@@ -0,0 +1,131 @@
++/*
++ * Tests for XNetworking
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "../test_fixtures.h"
++
++#include <vector>
++#include <windows.h>
++#include <winhttp.h>
++#include <xasync.h>
++#include <xnetworking.h>
++#include <xtaskqueue.h>
++
++class XNetworkingTests : public XGameRuntimeTests
++{
++};
++
++TEST_F(XNetworkingTests, ConnectivityHintSaysInternet)
++{
++    XNetworkingConnectivityHint hint{};
++
++    EXPECT_HRESULT_SUCCEEDED(XNetworkingGetConnectivityHint(&hint));
++    EXPECT_EQ(hint.connectivityLevel, XNetworkingConnectivityLevelHint::InternetAccess);
++    EXPECT_EQ(hint.connectivityCost, XNetworkingConnectivityCostHint::Unrestricted);
++    EXPECT_TRUE(hint.networkInitialized);
++    EXPECT_FALSE(hint.roaming);
++    EXPECT_EQ(XNetworkingGetConnectivityHint(nullptr), E_POINTER);
++}
++
++static void CheckSecurityInformation(XAsyncBlock *block, bool utf16)
++{
++    SIZE_T size = 0, used = 0;
++    XNetworkingSecurityInformation *information = nullptr;
++
++    EXPECT_HRESULT_SUCCEEDED(XAsyncGetStatus(block, TRUE));
++    EXPECT_HRESULT_SUCCEEDED(utf16 ? XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize(block, &size)
++                                   : XNetworkingQuerySecurityInformationForUrlAsyncResultSize(block, &size));
++    ASSERT_GE(size, sizeof(XNetworkingSecurityInformation));
++    std::vector<UINT8> buffer(size);
++    EXPECT_HRESULT_SUCCEEDED(utf16
++        ? XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult(block, size, &used, buffer.data(), &information)
++        : XNetworkingQuerySecurityInformationForUrlAsyncResult(block, size, &used, buffer.data(), &information));
++    ASSERT_NE(information, nullptr);
++    EXPECT_EQ(reinterpret_cast<UINT8 *>(information), buffer.data());
++    EXPECT_TRUE(information->enabledHttpSecurityProtocolFlags & WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2);
++    EXPECT_EQ(information->thumbprintCount, 0u);
++}
++
++TEST_F(XNetworkingTests, SecurityInformationHasNoPinning)
++{
++    XAsyncBlock block{};
++    EXPECT_HRESULT_SUCCEEDED(XNetworkingQuerySecurityInformationForUrlAsync("https://example.com/", &block));
++    CheckSecurityInformation(&block, false);
++
++    XAsyncBlock block16{};
++    EXPECT_HRESULT_SUCCEEDED(XNetworkingQuerySecurityInformationForUrlUtf16Async(L"https://example.com/", &block16));
++    CheckSecurityInformation(&block16, true);
++
++    EXPECT_EQ(XNetworkingQuerySecurityInformationForUrlAsync(nullptr, &block), E_POINTER);
++}
++
++TEST_F(XNetworkingTests, VerifyServerCertificateAcceptsWithoutPinning)
++{
++    XNetworkingSecurityInformation information{};
++    int request = 0;
++
++    EXPECT_HRESULT_SUCCEEDED(XNetworkingVerifyServerCertificate(&request, &information));
++    EXPECT_EQ(XNetworkingVerifyServerCertificate(&request, nullptr), E_POINTER);
++}
++
++struct HintCalls
++{
++    int calls = 0;
++    XNetworkingConnectivityLevelHint level = XNetworkingConnectivityLevelHint::Unknown;
++};
++
++static void __stdcall OnHint(void *context, const XNetworkingConnectivityHint *hint)
++{
++    auto *calls = static_cast<HintCalls *>(context);
++    calls->calls++;
++    calls->level = hint->connectivityLevel;
++}
++
++TEST_F(XNetworkingTests, ConnectivityHintCallbackRunsOnceOnTheQueue)
++{
++    XTaskQueueHandle queue = nullptr;
++    XTaskQueueRegistrationToken token{}, unused{};
++    HintCalls calls, canceled;
++
++    ASSERT_HRESULT_SUCCEEDED(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &queue));
++
++    EXPECT_HRESULT_SUCCEEDED(XNetworkingRegisterConnectivityHintChanged(queue, &calls, OnHint, &token));
++    EXPECT_EQ(calls.calls, 0); // not called during registration
++    EXPECT_HRESULT_SUCCEEDED(XNetworkingRegisterConnectivityHintChanged(queue, &canceled, OnHint, &unused));
++    EXPECT_TRUE(XNetworkingUnregisterConnectivityHintChanged(unused, TRUE)); // before its callback ran
++
++    while (XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 100)) {}
++    EXPECT_EQ(calls.calls, 1);
++    EXPECT_EQ(calls.level, XNetworkingConnectivityLevelHint::InternetAccess);
++    EXPECT_EQ(canceled.calls, 0);
++
++    EXPECT_TRUE(XNetworkingUnregisterConnectivityHintChanged(token, TRUE));
++    EXPECT_FALSE(XNetworkingUnregisterConnectivityHintChanged(token, TRUE));
++    XTaskQueueCloseHandle(queue);
++}
++
++// Minecraft asks for IXNetworkingImpl2: its own methods must be in the vtable.
++TEST_F(XNetworkingTests, SecondInterfaceMethodsExist)
++{
++    XNetworkingStatisticsBuffer statistics{};
++    UINT64 value = 0;
++
++    EXPECT_EQ(XNetworkingQueryStatistics(XNetworkingStatisticsType::TitleTcpQueuedReceivedBufferUsage, &statistics), E_NOTIMPL);
++    EXPECT_EQ(XNetworkingQueryConfigurationSetting(XNetworkingConfigurationSetting::MaxTitleTcpQueuedReceiveBufferSize, &value), E_NOTIMPL);
++}

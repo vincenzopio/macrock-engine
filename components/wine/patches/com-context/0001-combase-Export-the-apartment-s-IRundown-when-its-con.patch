@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 14:19:12 +0200
+Subject: [PATCH] combase: Export the apartment's IRundown when its context is
+ created.
+
+IContextCallback::ContextCallback from another apartment reaches the target apartment through
+the IRundown object at IPID {ffffffff-ffff-ffff-<oxid>}, which is exported only with the first
+object the apartment marshals. An apartment that never marshaled anything made the call fail,
+and C++/WinRT programs that co_await on a background thread and resume in their STA through
+ContextCallback (the Windows App SDK file picker in Minecraft Bedrock) crashed. Start remoting
+when the context token is first created, on the apartment's own thread.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: com-context
+---
+ dlls/combase/combase.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/dlls/combase/combase.c b/dlls/combase/combase.c
+index 94e256f7cc1771a6a29e2f3e6399e05ebbdf5511..1418689faaeafabba926e5f73370b3038a218236 100644
+--- a/dlls/combase/combase.c
++++ b/dlls/combase/combase.c
+@@ -2856,6 +2856,9 @@ HRESULT WINAPI CoGetContextToken(ULONG_PTR *token)
+         context->reported_ref = 0;
+         context->oxid = apt->oxid;
+ 
++        /* Export the apartment's IRundown, which other apartments' ContextCallback calls need. */
++        rpc_start_remoting(apt);
++
+         if (apt->multi_threaded)
+         {
+             EnterCriticalSection(&context_cs);

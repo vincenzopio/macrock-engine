@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 00:08:01 +0200
+Subject: [PATCH] service: take the socket path from XODUS_SOCKET.
+
+XODUS_SOCKET gives the socket's full path, so that each game session or account can have its
+own service; without it the service listens on xodus.sock in the runtime directory, as before.
+A socket file left by a service that did not exit cleanly is removed when nothing listens on it.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: socket-path
+---
+ crates/xodus-service/src/main.rs | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xodus-service/src/main.rs b/crates/xodus-service/src/main.rs
+index 392bd90def1730b374f477fdc222fe85a9419aa6..052734b1ac899b5a3ffa1bb12ef3cd27662fd3a9 100644
+--- a/crates/xodus-service/src/main.rs
++++ b/crates/xodus-service/src/main.rs
+@@ -47,9 +47,17 @@ async fn main() {
+         panic!("Device token isnt legacy")
+     };
+ 
+-    let runtime_dir = utils::get_runtime_dir();
+     let cancellation = CancellationToken::new();
+-    let socket_path = format!("{runtime_dir}/xodus.sock");
++    let socket_path = std::env::var("XODUS_SOCKET")
++        .ok()
++        .filter(|path| !path.is_empty())
++        .unwrap_or_else(|| format!("{}/xodus.sock", utils::get_runtime_dir()));
++    // A socket left by a service that did not exit cleanly would make bind() fail.
++    if std::path::Path::new(&socket_path).exists()
++        && std::os::unix::net::UnixStream::connect(&socket_path).is_err()
++    {
++        _ = std::fs::remove_file(&socket_path);
++    }
+     let trigger = cancellation.clone();
+     tokio::spawn(async move {
+         tokio::signal::ctrl_c()

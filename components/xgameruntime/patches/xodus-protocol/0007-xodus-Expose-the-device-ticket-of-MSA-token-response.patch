@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 01:18:44 +0200
+Subject: [PATCH] xodus: Expose the device ticket of MSA token responses.
+
+Besides the user's ticket, xodus-service answers an MSA token request with an RPS ticket for the
+device (DeviceRps) and its expiry (DeviceExpiry), from which a device token is requested. Parse
+both and add them to IMsaTokenResponse.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: xodus-protocol
+---
+ include/xodusprovider.idl     |  2 +
+ src/Xodus/Structs.cpp         | 23 ++++++++++-
+ src/Xodus/Structs.hpp         | 10 ++++-
+ src/Xodus/XodusXMLBuilder.cpp | 76 ++++++++++++++++++++---------------
+ 4 files changed, 74 insertions(+), 37 deletions(-)
+
+diff --git a/include/xodusprovider.idl b/include/xodusprovider.idl
+index 8b6cbab26b940833a6f8d96897aad19f4494a03f..9e378db7691aed92c52a9d1060ba7ee18b601d37 100644
+--- a/include/xodusprovider.idl
++++ b/include/xodusprovider.idl
+@@ -146,6 +146,8 @@ namespace Xodus
+     {
+         [propget] HRESULT Token( [out, retval] HSTRING *out );
+         [propget] HRESULT Expiry( [out, retval] Windows.Foundation.DateTime *out );
++        [propget] HRESULT DeviceRps( [out, retval] HSTRING *out );
++        [propget] HRESULT DeviceExpiry( [out, retval] Windows.Foundation.DateTime *out );
+     }
+ 
+     [
+diff --git a/src/Xodus/Structs.cpp b/src/Xodus/Structs.cpp
+index 4253d66ea2e467172baa1b3465c90768e1cf2a9d..df7813c23206cf0517e5edda81c8792d88ae6918 100644
+--- a/src/Xodus/Structs.cpp
++++ b/src/Xodus/Structs.cpp
+@@ -315,10 +315,14 @@ IPCResponseHandler::Invoke( IXodusIPCPacket *response )
+  */
+ MsaTokenResponse::MsaTokenResponse(
+     HSTRING token,
+-    ABI::Windows::Foundation::DateTime expiry )
+-: Expiry(expiry)
++    ABI::Windows::Foundation::DateTime expiry,
++    HSTRING deviceRps,
++    ABI::Windows::Foundation::DateTime deviceExpiry )
++: Expiry(expiry),
++  DeviceExpiry(deviceExpiry)
+ {
+     WindowsDuplicateString( token, &Token );
++    WindowsDuplicateString( deviceRps, &DeviceRps );
+ }
+ 
+ HRESULT WINAPI
+@@ -401,4 +405,19 @@ MsaTokenResponse::get_Expiry( ABI::Windows::Foundation::DateTime *out )
+     TRACE( "iface %p, out %p\n", this, out );
+     *out = Expiry;
+     return S_OK;
++}
++
++HRESULT WINAPI
++MsaTokenResponse::get_DeviceRps( HSTRING *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    return WindowsDuplicateString( DeviceRps, out );
++}
++
++HRESULT WINAPI
++MsaTokenResponse::get_DeviceExpiry( ABI::Windows::Foundation::DateTime *out )
++{
++    TRACE( "iface %p, out %p\n", this, out );
++    *out = DeviceExpiry;
++    return S_OK;
+ }
+\ No newline at end of file
+diff --git a/src/Xodus/Structs.hpp b/src/Xodus/Structs.hpp
+index 89c6af446af32d9984dce107fe9fb470f29166a3..be50860845c5eac1f9f6d3cdcad3d876b04d419f 100644
+--- a/src/Xodus/Structs.hpp
++++ b/src/Xodus/Structs.hpp
+@@ -104,11 +104,13 @@ class MsaTokenResponse :
+ {
+ public:
+     MsaTokenResponse() = default;
+-    virtual ~MsaTokenResponse() { WindowsDeleteString( Token ); }
++    virtual ~MsaTokenResponse() { WindowsDeleteString( Token ); WindowsDeleteString( DeviceRps ); }
+ 
+     MsaTokenResponse(
+         HSTRING token,
+-        ABI::Windows::Foundation::DateTime expiry );
++        ABI::Windows::Foundation::DateTime expiry,
++        HSTRING deviceRps = nullptr,
++        ABI::Windows::Foundation::DateTime deviceExpiry = {} );
+ 
+     MsaTokenResponse( const MsaTokenResponse& ) = delete;
+     MsaTokenResponse& operator=( const MsaTokenResponse& ) = delete;
+@@ -126,10 +128,14 @@ public:
+     /* IMsaTokenResponse Methods */
+     HRESULT WINAPI get_Token( HSTRING *out ) override;
+     HRESULT WINAPI get_Expiry( ABI::Windows::Foundation::DateTime *out ) override;
++    HRESULT WINAPI get_DeviceRps( HSTRING *out ) override;
++    HRESULT WINAPI get_DeviceExpiry( ABI::Windows::Foundation::DateTime *out ) override;
+ 
+ private:
+     ABI::Windows::Foundation::DateTime Expiry{ 0 };
+     HSTRING Token{ nullptr };
++    ABI::Windows::Foundation::DateTime DeviceExpiry{ 0 };
++    HSTRING DeviceRps{ nullptr };
+     std::atomic_long ref{ 1 };
+ };
+ 
+diff --git a/src/Xodus/XodusXMLBuilder.cpp b/src/Xodus/XodusXMLBuilder.cpp
+index afb5d6506d37bea0f13fbd09ec3529e67803c489..b2d1b175d3fd8cc462c9550b9d18f0a35c224c91 100644
+--- a/src/Xodus/XodusXMLBuilder.cpp
++++ b/src/Xodus/XodusXMLBuilder.cpp
+@@ -153,16 +153,43 @@ public:
+         return S_OK;
+     }
+ 
++    /* The text of an element as an HSTRING; the first one wins. */
++    static HRESULT ReadString( xmlNodePtr node, HSTRING *out )
++    {
++        xmlChar *content;
++        LPWSTR strW;
++        INT strLen;
++        HRESULT hr;
++
++        if ( *out || !( content = xmlNodeGetContent( node ) ) ) return S_OK;
++        strLen = MultiByteToWideChar( CP_UTF8, 0, reinterpret_cast<LPCSTR>(content), -1, nullptr, 0 );
++        if ( ( strW = (LPWSTR)CoTaskMemAlloc( strLen * sizeof(WCHAR) ) ) )
++        {
++            MultiByteToWideChar( CP_UTF8, 0, reinterpret_cast<LPCSTR>(content), -1, strW, strLen );
++            hr = WindowsCreateString( strW, strLen - 1, out );
++            CoTaskMemFree( strW );
++        }
++        else hr = E_OUTOFMEMORY;
++        xmlFree( content );
++        return hr;
++    }
++
++    /* A time in seconds since the Unix epoch, as a DateTime. */
++    static void ReadTime( xmlNodePtr node, DateTime *out )
++    {
++        xmlChar *content;
++
++        if ( !( content = xmlNodeGetContent( node ) ) ) return;
++        out->UniversalTime = ( strtoll( reinterpret_cast<LPCSTR>(content), nullptr, 10 ) + SEC_TO_UNIX_EPOCH ) * WINDOWS_TICK;
++        xmlFree( content );
++    }
++
+     HRESULT WINAPI
+     FromMsaTokenResponseXml( LPCSTR xml_string, IMsaTokenResponse **response ) override
+     {
+-        INT strLen;
+-        LPWSTR strW;
+         HRESULT hr = S_OK;
+-        HSTRING token = nullptr;
+-        DateTime expiry{};
+-        LONGLONG expiryUnix;
+-        xmlChar *childContent;
++        HSTRING token = nullptr, deviceRps = nullptr;
++        DateTime expiry{}, deviceExpiry{};
+         xmlDocPtr doc;
+         xmlNodePtr curr_child, root;
+ 
+@@ -187,37 +214,20 @@ public:
+ 
+         for ( curr_child = root->children; curr_child != nullptr && SUCCEEDED( hr ); curr_child = curr_child->next )
+         {
+-            if ( curr_child->type == XML_ELEMENT_NODE && !token && !strcmp( reinterpret_cast<LPCSTR>(curr_child->name), "Token" ) )
+-            {
+-                if ( !( childContent = xmlNodeGetContent( curr_child ) ) ) continue;
+-                strLen = MultiByteToWideChar( CP_UTF8, 0, reinterpret_cast<LPCSTR>(childContent), -1, nullptr, 0 );
+-                if ( ( strW = (LPWSTR)CoTaskMemAlloc( strLen * sizeof(WCHAR) ) ) )
+-                {
+-                    MultiByteToWideChar( CP_UTF8, 0, reinterpret_cast<LPCSTR>(childContent), -1, strW, strLen );
+-                    hr = WindowsCreateString( strW, strLen - 1, &token );
+-                    CoTaskMemFree( strW );
+-                }
+-                else hr = E_OUTOFMEMORY;
+-                xmlFree( childContent );
+-            }
+-            else if ( curr_child->type == XML_ELEMENT_NODE && !strcmp( reinterpret_cast<LPCSTR>(curr_child->name), "Expiry" ) )
+-            {
+-                if ( !( childContent = xmlNodeGetContent( curr_child ) ) ) continue;
+-                expiryUnix = strtoll( reinterpret_cast<LPCSTR>(childContent), nullptr, 10 );
+-                expiry.UniversalTime = ((INT64)expiryUnix + SEC_TO_UNIX_EPOCH) * WINDOWS_TICK;
+-                xmlFree( childContent );
+-            }
++            LPCSTR name = reinterpret_cast<LPCSTR>(curr_child->name);
++
++            if ( curr_child->type != XML_ELEMENT_NODE ) continue;
++            if ( !strcmp( name, "Token" ) ) hr = ReadString( curr_child, &token );
++            else if ( !strcmp( name, "Expiry" ) ) ReadTime( curr_child, &expiry );
++            else if ( !strcmp( name, "DeviceRps" ) ) hr = ReadString( curr_child, &deviceRps );
++            else if ( !strcmp( name, "DeviceExpiry" ) ) ReadTime( curr_child, &deviceExpiry );
+         }
+         xmlFreeDoc( doc );
+ 
+-        if ( FAILED( hr ) )
+-        {
+-            WindowsDeleteString( token );
+-            return hr;
+-        }
+-        *response = new MsaTokenResponse( token, expiry );
++        if ( SUCCEEDED( hr ) ) *response = new MsaTokenResponse( token, expiry, deviceRps, deviceExpiry );
+         WindowsDeleteString( token );
+-        return S_OK;
++        WindowsDeleteString( deviceRps );
++        return hr;
+     }
+ 
+ private:

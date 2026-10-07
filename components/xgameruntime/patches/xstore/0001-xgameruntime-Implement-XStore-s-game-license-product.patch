@@ -1,0 +1,1584 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 10:48:03 +0200
+Subject: [PATCH] xgameruntime: Implement XStore's game license, product
+ queries and Store ID keys.
+
+XStoreQueryGameLicenseAsync() asks xodus-service for the signed-in account's license to the
+title named by StoreId in its MicrosoftGame.config, in the market of the user's region: active,
+trial and SKU. An account that does not own the title gets an inactive license; game license
+change registrations are accepted, as the license does not change during a session.
+
+XStoreQueryAssociatedProductsAsync() pages through the title's add-ons as the Store's public
+catalog lists them (storeedgefd.dsx.mp.microsoft.com/v9.0/products/<id>/addons, 25 a page, the
+largest it allows), in the market of the user's region and the user's locale: title, description,
+kind, the price as the Store formats it, and one SKU per Store SKU.
+XStoreProductsQueryHasMorePages() and XStoreProductsQueryNextPageAsync() follow the catalog's
+pages; past the last one the call completes with E_BOUNDS. Every product query result is read the
+same way, whichever *Result function a title uses. The Store compresses large answers, so WinHTTP
+requests accept gzip and deflate.
+
+Ownership is not in the public catalog, and no Store service answers it for the user's own
+tokens (collections.mp.microsoft.com returns an empty list even for the game the account owns):
+isInUserCollection stays FALSE, and entitled product queries complete with no products and log
+that ownership is unknown.
+
+XStoreGetUserCollectionsIdAsync() and XStoreGetUserPurchaseIdAsync() ask
+collections.mp.microsoft.com and purchase.mp.microsoft.com for Microsoft Store ID keys, as the
+GDK documentation describes, with the title service's ticket and the user's Xbox token for the
+relying party the NSAL names (XUserTokenForRequest()). Tickets and keys are credentials and are
+not logged.
+
+The other XStore calls are stubs; asynchronous ones still start and complete with E_NOTIMPL,
+because titles wait for the completion (Minecraft stops loading at 41% otherwise). XStoreTests
+check contexts and that every call completes; XStoreLiveTests ask for the real license and
+products (XGR_LIVE_XBOX=1).
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: xstore
+---
+ src/CMakeLists.txt           |   3 +-
+ src/System/GameConfig.cpp    |   2 +
+ src/System/GameConfig.h      |   1 +
+ src/System/XStore.cpp        | 985 +++++++++++++++++++++++++++++++++++
+ src/System/XUser.cpp         |  25 +
+ src/System/XUser.h           |  35 ++
+ src/System/XboxLive.cpp      | 109 ++++
+ src/System/XboxLive.h        |  31 ++
+ src/main.cpp                 |   2 +
+ src/private.h                |   2 +
+ tests/CMakeLists.txt         |   1 +
+ tests/System/test_xstore.cpp | 181 +++++++
+ 12 files changed, 1376 insertions(+), 1 deletion(-)
+ create mode 100644 src/System/XStore.cpp
+ create mode 100644 src/System/XUser.h
+ create mode 100644 tests/System/test_xstore.cpp
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 4b60d7b790566ff528ead28ef99b2e51213d116a..7e93c7f31761b4d56e589e49bab2a1caa4530936 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -26,6 +26,7 @@ target_sources(xgameruntime PRIVATE
+         System/XGameRuntimeFeature.cpp
+         System/XNetworking.cpp
+         System/XSystem.cpp
++        System/XStore.cpp
+         System/XUser.cpp
+         System/Nsal.cpp
+         System/XboxLive.cpp
+@@ -67,4 +68,4 @@ target_include_directories(xgameruntime
+ 
+ target_compile_features(xgameruntime
+         PUBLIC
+-        cxx_std_23 )
++        cxx_std_23 )
+\ No newline at end of file
+diff --git a/src/System/GameConfig.cpp b/src/System/GameConfig.cpp
+index 1fbec2b026ef0514762a1b781e73d2bf7110ea41..5c5ef7b08d30bca0af401e9282faf2b57a747b11 100644
+--- a/src/System/GameConfig.cpp
++++ b/src/System/GameConfig.cpp
+@@ -78,6 +78,8 @@ static HRESULT ParseConfig( xmlDocPtr doc )
+             lstrcpynA( config.msaAppId, value, sizeof(config.msaAppId) );
+         else if ( !strcmp( (const char *)child->name, "MSAFullTrust" ) )
+             config.msaFullTrust = !strcmp( value, "true" );
++        else if ( !strcmp( (const char *)child->name, "StoreId" ) )
++            lstrcpynA( config.storeId, value, sizeof(config.storeId) );
+ 
+         xmlFree( value );
+     }
+diff --git a/src/System/GameConfig.h b/src/System/GameConfig.h
+index 6f8802ae3bb1be6b443f84d43f56767e49a6944c..e066d1b8687358938b9ab65382c480cfb7adc762 100644
+--- a/src/System/GameConfig.h
++++ b/src/System/GameConfig.h
+@@ -30,6 +30,7 @@ struct GameConfig
+     HRESULT status = E_GAMERUNTIME_NOT_INITIALIZED; /* S_OK once read; why it could not be otherwise */
+     UINT32 titleId = 0;                             /* <TitleId>, hexadecimal in the file */
+     char msaAppId[64] = "";                         /* <MSAAppId> */
++    char storeId[16] = "";                          /* <StoreId>: the title's Store product id */
+     BOOLEAN msaFullTrust = FALSE;                   /* <MSAFullTrust> */
+ };
+ 
+diff --git a/src/System/XStore.cpp b/src/System/XStore.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..5971164a663f30d000bbba92f4994f8335e56513
+--- /dev/null
++++ b/src/System/XStore.cpp
+@@ -0,0 +1,985 @@
++/*
++ * Xbox Game runtime Library
++ *  GDK Component: System API -> XStore
++ *
++ * The game license is the account's real one, which xodus-service gets from the Store's
++ * licensing service with the account's Microsoft tokens; nothing is granted here. The rest of
++ * the Store is not implemented yet: its calls are logged and fail.
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "../private.h"
++#include "../Xodus/GameLicense.h"
++#include "GameConfig.h"
++#include "XboxLive.h"
++#include "XUser.h"
++
++#include <atomic>
++#include <cwctype>
++#include <deque>
++#include <string>
++#include <vector>
++
++static std::string Join( const char **ids, SIZE_T count )
++{
++    std::string joined;
++    for ( SIZE_T i = 0; ids && i < count; ++i )
++        joined += std::string( i ? "," : "" ) + ( ids[i] ? ids[i] : "(null)" );
++    return joined;
++}
++
++/* A store context holds nothing: there is one user. */
++struct XStoreContext
++{
++};
++
++/* Asynchronous stubs still start and complete with E_NOTIMPL: titles wait for the completion. */
++static HRESULT CALLBACK FailProvider( XAsyncOp op, const XAsyncProviderData *data )
++{
++    if ( op == XAsyncOp::Begin ) return XAsyncSchedule( data->async, 0 );
++    if ( op == XAsyncOp::DoWork ) XAsyncComplete( data->async, (HRESULT)(INT_PTR)data->context, 0 );
++    return S_OK;
++}
++
++static HRESULT FailAsync( XAsyncBlock *async, HRESULT hr = E_NOTIMPL )
++{
++    if ( !async ) return E_POINTER;
++    return XAsyncBegin( async, (void *)(INT_PTR)hr, nullptr, nullptr, FailProvider );
++}
++
++/* The failure, which also releases the call. */
++static HRESULT FailedResult( XAsyncBlock *async )
++{
++    if ( !async ) return E_POINTER;
++    return XAsyncGetResult( async, nullptr, 0, nullptr, nullptr );
++}
++
++/* The Store market of the user's region ("IT"), or "US". */
++static void GetMarket( char market[3] )
++{
++    WCHAR region[16];
++
++    strcpy( market, "US" );
++    if ( GetUserDefaultGeoName( region, (int)(sizeof(region) / sizeof(*region)) ) == 3 && iswalpha( region[0] ) &&
++         iswalpha( region[1] ) )
++    {
++        market[0] = (char)towupper( region[0] );
++        market[1] = (char)towupper( region[1] );
++    }
++}
++
++/* A page of a title's associated products, read from the Store's public catalog, and where the
++ * next page starts. The products' strings and arrays live as long as the page. */
++struct XStoreProductQuery
++{
++    /* Entitled products are unknown: such a query has none, in one page. */
++    BOOL entitled = FALSE;
++    XStoreProductKind kinds = XStoreProductKind::None;
++    UINT32 pageSize = 25, skip = 0, total = 0;
++    std::string storeId, market, locale;
++    BOOL handedOut = FALSE; /* the title owns it and closes it */
++
++    std::vector<XStoreProduct> products;
++    std::vector<std::vector<XStoreSku>> skus;                   /* moving a vector keeps its buffer */
++    std::vector<std::vector<XStoreAvailability>> availabilities;
++    std::deque<std::string> strings;                            /* a deque keeps its elements in place */
++
++    const char *Keep( const std::string &text )
++    {
++        strings.push_back( text );
++        return strings.back().c_str();
++    }
++};
++
++static XStoreProductKind KindOf( const std::string &type )
++{
++    if ( type == "Durable" ) return XStoreProductKind::Durable;
++    if ( type == "Consumable" ) return XStoreProductKind::Consumable;
++    if ( type == "UnmanagedConsumable" ) return XStoreProductKind::UnmanagedConsumable;
++    if ( type == "Game" ) return XStoreProductKind::Game;
++    if ( type == "Pass" ) return XStoreProductKind::Pass;
++    return XStoreProductKind::None;
++}
++
++/* The catalog gives one price, already formatted for the market: no sale, no recurrence. */
++static void FillPrice( XStoreProductQuery *query, double price, const std::string &formatted,
++                       const std::string &currency, XStorePrice *out )
++{
++    out->basePrice = out->price = (float)price;
++    out->currencyCode = query->Keep( currency );
++    lstrcpynA( out->formattedBasePrice, formatted.c_str(), sizeof(out->formattedBasePrice) );
++    lstrcpynA( out->formattedPrice, formatted.c_str(), sizeof(out->formattedPrice) );
++}
++
++static HRESULT ReadProductPage( XStoreProductQuery *query )
++{
++    std::vector<XboxLive::StoreAddOn> addOns;
++    HRESULT hr;
++
++    if ( FAILED( hr = XboxLive::QueryStoreAddOns( query->storeId.c_str(), query->market.c_str(),
++                                                  query->locale.c_str(), query->skip, query->pageSize, &addOns,
++                                                  &query->total ) ) )
++        return hr;
++    query->products.reserve( addOns.size() );
++    for ( const XboxLive::StoreAddOn &addOn : addOns )
++    {
++        XStoreProductKind kind = KindOf( addOn.type );
++        if ( !( static_cast<UINT32>(kind) & static_cast<UINT32>(query->kinds) ) ) continue;
++
++        XStoreProduct product{};
++        product.storeId = query->Keep( addOn.productId );
++        product.title = query->Keep( addOn.title );
++        product.description = query->Keep( addOn.description );
++        product.language = query->Keep( query->locale );
++        product.inAppOfferToken = query->Keep( "" );
++        product.linkUri = const_cast<char *>(query->Keep( "ms-windows-store://pdp/?ProductId=" + addOn.productId ));
++        product.productKind = kind;
++        FillPrice( query, addOn.price, addOn.displayPrice, addOn.skus.empty() ? "" : addOn.skus[0].currencyCode,
++                   &product.price );
++        /* Ownership is not in the public catalog: isInUserCollection stays FALSE. */
++
++        std::vector<XStoreSku> skus;
++        std::vector<XStoreAvailability> availabilities;
++        skus.reserve( addOn.skus.size() );
++        availabilities.reserve( addOn.skus.size() ); /* the skus point into it */
++        for ( const XboxLive::StoreSku &storeSku : addOn.skus )
++        {
++            XStoreSku sku{};
++            XStoreAvailability availability{};
++
++            sku.skuId = query->Keep( storeSku.skuId );
++            sku.title = query->Keep( storeSku.title.empty() ? addOn.title : storeSku.title );
++            sku.description = product.description;
++            sku.language = product.language;
++            FillPrice( query, storeSku.price, storeSku.displayPrice, storeSku.currencyCode, &sku.price );
++            sku.isTrial = storeSku.type == "trial";
++            availability.availabilityId = query->Keep( storeSku.availabilityId );
++            availability.price = sku.price;
++            availabilities.push_back( availability );
++            sku.availabilitiesCount = 1;
++            sku.availabilities = &availabilities.back();
++            skus.push_back( sku );
++        }
++        product.skusCount = (UINT32)skus.size();
++        product.skus = skus.data();
++        query->skus.push_back( std::move( skus ) );
++        query->availabilities.push_back( std::move( availabilities ) );
++        query->products.push_back( product );
++    }
++    TRACE( "products %u-%u of %u: %zu of the kinds asked.\n", query->skip, query->skip + query->pageSize,
++           query->total, query->products.size() );
++    return S_OK;
++}
++
++/* Every product query's result is a query handle, whichever *Result function a title reads it
++ * with: Minecraft reads XStoreQueryAssociatedProductsAsync's with XStoreQueryProductsResult. */
++static const char productQueryIdentity[] = "XStoreProductQuery";
++
++static HRESULT CALLBACK ProductQueryProvider( XAsyncOp op, const XAsyncProviderData *data )
++{
++    auto *query = static_cast<XStoreProductQuery *>(data->context);
++
++    switch ( op )
++    {
++        case XAsyncOp::Begin:
++            return XAsyncSchedule( data->async, 0 );
++
++        case XAsyncOp::DoWork:
++        {
++            HRESULT hr = query->storeId.empty() ? E_GAMEPACKAGE_NO_STORE_ID :
++                         query->entitled ? S_OK : ReadProductPage( query );
++            if ( FAILED( hr ) ) WARN( "product page from %u failed, hr %#lx.\n", query->skip, hr );
++            XAsyncComplete( data->async, hr, SUCCEEDED( hr ) ? sizeof(XStoreProductQueryHandle) : 0 );
++            return S_OK;
++        }
++
++        case XAsyncOp::GetResult:
++            *static_cast<XStoreProductQueryHandle *>(data->buffer) = query;
++            query->handedOut = TRUE;
++            return S_OK;
++
++        case XAsyncOp::Cleanup:
++            if ( !query->handedOut ) delete query;
++            return S_OK;
++
++        default:
++            return S_OK;
++    }
++}
++
++/* Start reading a page of the title's associated products of some kinds, from skip on. */
++static HRESULT BeginProductQuery( XStoreProductKind kinds, UINT32 pageSize, UINT32 skip, XAsyncBlock *async,
++                                  BOOL entitled = FALSE )
++{
++    WCHAR locale[LOCALE_NAME_MAX_LENGTH];
++    char market[3];
++    HRESULT hr;
++
++    if ( !async ) return E_POINTER;
++    auto *query = new XStoreProductQuery();
++    query->entitled = entitled;
++    query->kinds = kinds;
++    query->pageSize = pageSize && pageSize < 25 ? pageSize : 25; /* the catalog's largest page */
++    query->skip = skip;
++    query->storeId = GetGameConfig().storeId;
++    GetMarket( market );
++    query->market = market;
++    query->locale = "en-US";
++    if ( GetUserDefaultLocaleName( locale, LOCALE_NAME_MAX_LENGTH ) )
++    {
++        std::string name;
++        for ( const WCHAR *c = locale; *c && ( iswalnum( *c ) || *c == '-' ); ++c ) name += (char)*c;
++        if ( name.size() >= 2 ) query->locale = name;
++    }
++
++    if ( FAILED( hr = XAsyncBegin( async, query, productQueryIdentity, productQueryIdentity, ProductQueryProvider ) ) )
++        delete query;
++    return hr;
++}
++
++static HRESULT ProductQueryResult( XAsyncBlock *async, XStoreProductQueryHandle *handle )
++{
++    if ( !async || !handle ) return E_POINTER;
++    *handle = nullptr;
++    return XAsyncGetResult( async, productQueryIdentity, sizeof(*handle), handle, nullptr );
++}
++
++/* Microsoft Store ID keys ("User Store ID" in the GDK documentation): the title's service gives
++ * a ticket, the Store answers a key with which that service can see or change the user's
++ * entitlements. Both are credentials, never logged. */
++struct StoreIdKeyCall
++{
++    const wchar_t *host, *path;
++    std::string body, key;
++};
++
++static const char collectionsIdIdentity[] = "XStoreGetUserCollectionsIdAsync";
++static const char purchaseIdIdentity[] = "XStoreGetUserPurchaseIdAsync";
++
++static HRESULT CALLBACK StoreIdKeyProvider( XAsyncOp op, const XAsyncProviderData *data )
++{
++    auto *call = static_cast<StoreIdKeyCall *>(data->context);
++
++    switch ( op )
++    {
++        case XAsyncOp::Begin:
++            return XAsyncSchedule( data->async, 0 );
++
++        case XAsyncOp::DoWork:
++        {
++            std::string url = "https://" + XboxLive::Narrow( call->host ) + XboxLive::Narrow( call->path );
++            std::string token, signature;
++            HRESULT hr;
++
++            if ( SUCCEEDED( hr = XUserTokenForRequest( "POST", url.c_str(), call->body, &token, &signature ) ) )
++                hr = XboxLive::RequestStoreIdKey( call->host, call->path, call->body, token, signature, &call->key );
++            if ( FAILED( hr ) ) WARN( "no Store ID key, hr %#lx.\n", hr );
++            XAsyncComplete( data->async, hr, SUCCEEDED( hr ) ? call->key.size() + 1 : 0 );
++            return S_OK;
++        }
++
++        case XAsyncOp::GetResult:
++            memcpy( data->buffer, call->key.c_str(), call->key.size() + 1 );
++            return S_OK;
++
++        case XAsyncOp::Cleanup:
++            delete call;
++            return S_OK;
++
++        default:
++            return S_OK;
++    }
++}
++
++static HRESULT BeginStoreIdKey( const wchar_t *host, const wchar_t *path, const char *identity,
++                                const char *serviceTicket, const char *publisherUserId, XAsyncBlock *async )
++{
++    HRESULT hr;
++
++    auto *call = new StoreIdKeyCall{ host, path, XboxLive::StoreIdKeyRequestBody( serviceTicket, publisherUserId ) };
++    if ( FAILED( hr = XAsyncBegin( async, call, identity, identity, StoreIdKeyProvider ) ) ) delete call;
++    return hr;
++}
++
++static const char gameLicenseIdentity[] = "XStoreQueryGameLicenseAsync";
++
++static HRESULT CALLBACK GameLicenseProvider( XAsyncOp op, const XAsyncProviderData *data )
++{
++    auto *license = static_cast<XStoreGameLicense *>(data->context);
++
++    switch ( op )
++    {
++        case XAsyncOp::Begin:
++            return XAsyncSchedule( data->async, 0 );
++
++        case XAsyncOp::DoWork:
++        {
++            const GameConfig &config = GetGameConfig();
++            XodusGameLicense found{};
++            char market[3];
++            HRESULT hr;
++
++            GetMarket( market );
++            if ( !config.storeId[0] ) hr = E_GAMEPACKAGE_NO_STORE_ID;
++            else if ( ( hr = XodusRequestGameLicense( config.storeId, market, &found ) ) == E_FAIL )
++                hr = E_GAMESTORE_SERVER_ERROR;
++            if ( SUCCEEDED( hr ) )
++            {
++                lstrcpynA( license->skuStoreId, found.skuStoreId, sizeof(license->skuStoreId) );
++                license->isActive = found.isActive;
++                license->isTrial = found.isTrial;
++                license->isTrialOwnedByThisUser = found.isTrial;
++            }
++            else WARN( "no game license for %s, hr %#lx.\n", config.storeId, hr );
++            XAsyncComplete( data->async, hr, SUCCEEDED( hr ) ? sizeof(*license) : 0 );
++            return S_OK;
++        }
++
++        case XAsyncOp::GetResult:
++            memcpy( data->buffer, license, sizeof(*license) );
++            return S_OK;
++
++        case XAsyncOp::Cleanup:
++            delete license;
++            return S_OK;
++
++        default:
++            return S_OK;
++    }
++}
++
++class XStoreImpl : public IXStoreImpl6
++{
++public:
++    HRESULT WINAPI QueryInterface( REFIID iid, void **out ) noexcept override
++    {
++        TRACE( "iface %p, iid %s, out %p.\n", this, debugstr_guid( &iid ), out );
++
++        if ( !out ) return E_POINTER;
++        *out = nullptr;
++        if ( iid == __uuidof( IUnknown ) || iid == __uuidof( IXStoreImpl ) || iid == __uuidof( IXStoreImpl2 ) ||
++             iid == __uuidof( IXStoreImpl3 ) || iid == __uuidof( IXStoreImpl4 ) || iid == __uuidof( IXStoreImpl5 ) ||
++             iid == __uuidof( IXStoreImpl6 ) )
++        {
++            *out = static_cast<IXStoreImpl6 *>(this);
++            AddRef();
++            return S_OK;
++        }
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &iid ) );
++        return E_NOINTERFACE;
++    }
++
++    ULONG WINAPI AddRef() noexcept override { return static_cast<ULONG>(++ref); }
++
++    // A static object: never deleted.
++    ULONG WINAPI Release() noexcept override { return static_cast<ULONG>(--ref); }
++
++    /* IXStoreImpl */
++    HRESULT WINAPI XStoreCreateContext( const XUserHandle user, XStoreContextHandle *storeContextHandle ) override
++    {
++        if ( !storeContextHandle ) return E_POINTER;
++        *storeContextHandle = new XStoreContext{};
++        return S_OK;
++    }
++
++    void WINAPI XStoreCloseContextHandle( XStoreContextHandle storeContextHandle ) override
++    {
++        delete static_cast<XStoreContext *>(storeContextHandle);
++    }
++
++    HRESULT WINAPI XStoreQueryAssociatedProductsAsync( const XStoreContextHandle storeContextHandle,
++                                                       XStoreProductKind productKinds, UINT32 maxItemsToRetrievePerPage,
++                                                       XAsyncBlock *async ) override
++    {
++        TRACE( "kinds %#x, page %u.\n", static_cast<UINT32>(productKinds), maxItemsToRetrievePerPage );
++        if ( !storeContextHandle ) return E_INVALIDARG;
++        return BeginProductQuery( productKinds, maxItemsToRetrievePerPage, 0, async );
++    }
++
++    HRESULT WINAPI XStoreQueryAssociatedProductsResult( XAsyncBlock *async,
++                                                        XStoreProductQueryHandle *productQueryHandle ) override
++    {
++        return ProductQueryResult( async, productQueryHandle );
++    }
++
++    HRESULT WINAPI XStoreQueryProductsAsync( const XStoreContextHandle storeContextHandle,
++                                             XStoreProductKind productKinds, const char **storeIds,
++                                             SIZE_T storeIdsCount, const char **actionFilters,
++                                             SIZE_T actionFiltersCount, XAsyncBlock *async ) override
++    {
++        FIXME( "kinds %#x, ids %s, filters %s stub!\n", static_cast<UINT32>(productKinds),
++               Join( storeIds, storeIdsCount ).c_str(), Join( actionFilters, actionFiltersCount ).c_str() );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreQueryProductsResult( XAsyncBlock *async,
++                                              XStoreProductQueryHandle *productQueryHandle ) override
++    {
++        return ProductQueryResult( async, productQueryHandle );
++    }
++
++    HRESULT WINAPI XStoreQueryEntitledProductsAsync( const XStoreContextHandle storeContextHandle,
++                                                     XStoreProductKind productKinds, UINT32 maxItemsToRetrievePerPage,
++                                                     XAsyncBlock *async ) override
++    {
++        FIXME( "kinds %#x, page %u: ownership is unknown, no products.\n", static_cast<UINT32>(productKinds),
++               maxItemsToRetrievePerPage );
++        if ( !storeContextHandle ) return E_INVALIDARG;
++        return BeginProductQuery( productKinds, maxItemsToRetrievePerPage, 0, async, TRUE );
++    }
++
++    HRESULT WINAPI XStoreQueryEntitledProductsResult( XAsyncBlock *async,
++                                                      XStoreProductQueryHandle *productQueryHandle ) override
++    {
++        return ProductQueryResult( async, productQueryHandle );
++    }
++
++    HRESULT WINAPI XStoreQueryProductForCurrentGameAsync( const XStoreContextHandle storeContextHandle,
++                                                          XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreQueryProductForCurrentGameResult( XAsyncBlock *async,
++                                                           XStoreProductQueryHandle *productQueryHandle ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreQueryProductForPackageAsync( const XStoreContextHandle storeContextHandle,
++                                                      XStoreProductKind productKinds, const char *packageIdentifier,
++                                                      XAsyncBlock *async ) override
++    {
++        FIXME( "kinds %#x, package %s stub!\n", static_cast<UINT32>(productKinds),
++               packageIdentifier ? packageIdentifier : "(null)" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreQueryProductForPackageResult( XAsyncBlock *async,
++                                                       XStoreProductQueryHandle *productQueryHandle ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreEnumerateProductsQuery( const XStoreProductQueryHandle productQueryHandle, void *context,
++                                                 XStoreProductQueryCallback *callback ) override
++    {
++        auto *query = static_cast<XStoreProductQuery *>(productQueryHandle);
++
++        if ( !query || !callback ) return E_INVALIDARG;
++        for ( const XStoreProduct &product : query->products )
++            if ( !callback( &product, context ) ) break;
++        return S_OK;
++    }
++
++    BOOLEAN WINAPI XStoreProductsQueryHasMorePages( const XStoreProductQueryHandle productQueryHandle ) override
++    {
++        auto *query = static_cast<XStoreProductQuery *>(productQueryHandle);
++        return query && query->skip + query->pageSize < query->total;
++    }
++
++    HRESULT WINAPI XStoreProductsQueryNextPageAsync( const XStoreProductQueryHandle productQueryHandle,
++                                                     XAsyncBlock *async ) override
++    {
++        auto *query = static_cast<XStoreProductQuery *>(productQueryHandle);
++
++        if ( !query ) return E_INVALIDARG;
++        if ( query->skip + query->pageSize >= query->total ) return FailAsync( async, E_BOUNDS );
++        return BeginProductQuery( query->kinds, query->pageSize, query->skip + query->pageSize, async,
++                                  query->entitled );
++    }
++
++    HRESULT WINAPI XStoreProductsQueryNextPageResult( XAsyncBlock *async,
++                                                      XStoreProductQueryHandle *productQueryHandle ) override
++    {
++        return ProductQueryResult( async, productQueryHandle );
++    }
++
++    void WINAPI XStoreCloseProductsQueryHandle( XStoreProductQueryHandle productQueryHandle ) override
++    {
++        delete static_cast<XStoreProductQuery *>(productQueryHandle);
++    }
++
++    HRESULT WINAPI XStoreAcquireLicenseForPackageAsync( const XStoreProductQueryHandle productQueryHandle,
++                                                        const char *packageIdentifier, XAsyncBlock *async ) override
++    {
++        FIXME( "package %s stub!\n", packageIdentifier ? packageIdentifier : "(null)" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreAcquireLicenseForPackageResult( XAsyncBlock *async,
++                                                         XStoreLicenseHandle *storeLicenseHandle ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    BOOLEAN WINAPI XStoreIsLicenseValid( const XStoreLicenseHandle storeLicenseHandle ) override
++    {
++        FIXME( "stub!\n" );
++        return FALSE;
++    }
++
++    void WINAPI XStoreCloseLicenseHandle( XStoreLicenseHandle storeLicenseHandle ) override
++    {
++        FIXME( "stub!\n" );
++    }
++
++    HRESULT WINAPI XStoreCanAcquireLicenseForStoreIdAsync( const XStoreContextHandle storeContextHandle,
++                                                           const char *storeProductId, XAsyncBlock *async ) override
++    {
++        FIXME( "id %s stub!\n", storeProductId ? storeProductId : "(null)" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreCanAcquireLicenseForStoreIdResult( XAsyncBlock *async,
++                                                            XStoreCanAcquireLicenseResult *storeCanAcquireLicense ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreCanAcquireLicenseForPackageAsync( const XStoreContextHandle storeContextHandle,
++                                                           const char *packageIdentifier, XAsyncBlock *async ) override
++    {
++        FIXME( "package %s stub!\n", packageIdentifier ? packageIdentifier : "(null)" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreCanAcquireLicenseForPackageResult( XAsyncBlock *async,
++                                                            XStoreCanAcquireLicenseResult *storeCanAcquireLicense ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreQueryGameLicenseAsync( const XStoreContextHandle storeContextHandle,
++                                                XAsyncBlock *async ) override
++    {
++        HRESULT hr;
++
++        if ( !storeContextHandle ) return E_INVALIDARG;
++        if ( !async ) return E_POINTER;
++        auto *license = new XStoreGameLicense{};
++        if ( FAILED( hr = XAsyncBegin( async, license, gameLicenseIdentity, gameLicenseIdentity,
++             GameLicenseProvider ) ) )
++            delete license;
++        return hr;
++    }
++
++    HRESULT WINAPI XStoreQueryGameLicenseResult( XAsyncBlock *async, XStoreGameLicense *license ) override
++    {
++        if ( !async || !license ) return E_POINTER;
++        return XAsyncGetResult( async, gameLicenseIdentity, sizeof(*license), license, nullptr );
++    }
++
++    HRESULT WINAPI XStoreQueryAddOnLicensesAsync( const XStoreContextHandle storeContextHandle,
++                                                  XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreQueryAddOnLicensesResultCount( XAsyncBlock *async, UINT32 *count ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreQueryAddOnLicensesResult( XAsyncBlock *async, UINT32 count,
++                                                   XStoreAddonLicense addOnLicenses[] ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreQueryConsumableBalanceRemainingAsync( const XStoreContextHandle storeContextHandle,
++                                                               const char *storeProductId, XAsyncBlock *async ) override
++    {
++        FIXME( "id %s stub!\n", storeProductId ? storeProductId : "(null)" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreQueryConsumableBalanceRemainingResult( XAsyncBlock *async,
++                                                                XStoreConsumableResult *consumableResult ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreReportConsumableFulfillmentAsync( const XStoreContextHandle storeContextHandle,
++                                                           const char *storeProductId, UINT32 quantity, GUID trackingId,
++                                                           XAsyncBlock *async ) override
++    {
++        FIXME( "id %s, quantity %u stub!\n", storeProductId ? storeProductId : "(null)", quantity );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreReportConsumableFulfillmentResult( XAsyncBlock *async,
++                                                            XStoreConsumableResult *consumableResult ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreGetUserCollectionsIdAsync( const XStoreContextHandle storeContextHandle,
++                                                    const char *serviceTicket, const char *publisherUserId,
++                                                    XAsyncBlock *async ) override
++    {
++        if ( !storeContextHandle || !serviceTicket || !*serviceTicket ) return E_INVALIDARG;
++        if ( !async ) return E_POINTER;
++        return BeginStoreIdKey( L"collections.mp.microsoft.com", L"/v7.0/beneficiaries/me/keys", collectionsIdIdentity,
++                                serviceTicket, publisherUserId, async );
++    }
++
++    HRESULT WINAPI XStoreGetUserCollectionsIdResultSize( XAsyncBlock *async, SIZE_T *size ) override
++    {
++        if ( !async || !size ) return E_POINTER;
++        return XAsyncGetResultSize( async, size );
++    }
++
++    HRESULT WINAPI XStoreGetUserCollectionsIdResult( XAsyncBlock *async, SIZE_T size, char *result ) override
++    {
++        if ( !async || !result ) return E_POINTER;
++        return XAsyncGetResult( async, collectionsIdIdentity, size, result, nullptr );
++    }
++
++    HRESULT WINAPI XStoreGetUserPurchaseIdAsync( const XStoreContextHandle storeContextHandle,
++                                                 const char *serviceTicket, const char *publisherUserId,
++                                                 XAsyncBlock *async ) override
++    {
++        if ( !storeContextHandle || !serviceTicket || !*serviceTicket ) return E_INVALIDARG;
++        if ( !async ) return E_POINTER;
++        return BeginStoreIdKey( L"purchase.mp.microsoft.com", L"/v7.0/users/me/keys", purchaseIdIdentity, serviceTicket,
++                                publisherUserId, async );
++    }
++
++    HRESULT WINAPI XStoreGetUserPurchaseIdResultSize( XAsyncBlock *async, SIZE_T *size ) override
++    {
++        if ( !async || !size ) return E_POINTER;
++        return XAsyncGetResultSize( async, size );
++    }
++
++    HRESULT WINAPI XStoreGetUserPurchaseIdResult( XAsyncBlock *async, SIZE_T size, char *result ) override
++    {
++        if ( !async || !result ) return E_POINTER;
++        return XAsyncGetResult( async, purchaseIdIdentity, size, result, nullptr );
++    }
++
++    HRESULT WINAPI XStoreQueryLicenseTokenAsync( const XStoreContextHandle storeContextHandle, const char **productIds,
++                                                 SIZE_T productIdsCount, const char *customDeveloperString,
++                                                 XAsyncBlock *async ) override
++    {
++        FIXME( "ids %s stub!\n", Join( productIds, productIdsCount ).c_str() );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreQueryLicenseTokenResultSize( XAsyncBlock *async, SIZE_T *size ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreQueryLicenseTokenResult( XAsyncBlock *async, SIZE_T size, char *result ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI __PADDING__() override
++    {
++        FIXME( "stub!\n" );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI __PADDING_2__() override
++    {
++        FIXME( "stub!\n" );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI __PADDING_3__() override
++    {
++        FIXME( "stub!\n" );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XStoreShowPurchaseUIAsync( const XStoreContextHandle storeContextHandle, const char *storeId,
++                                              const char *name, const char *extendedJsonData,
++                                              XAsyncBlock *async ) override
++    {
++        FIXME( "id %s stub!\n", storeId ? storeId : "(null)" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreShowPurchaseUIResult( XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreShowRateAndReviewUIAsync( const XStoreContextHandle storeContextHandle,
++                                                   XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreShowRateAndReviewUIResult( XAsyncBlock *async, XStoreRateAndReviewResult *result ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreShowRedeemTokenUIAsync( const XStoreContextHandle storeContextHandle, const char *token,
++                                                 const char **allowedStoreIds, SIZE_T allowedStoreIdsCount,
++                                                 BOOLEAN disallowCsvRedemption, XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreShowRedeemTokenUIResult( XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreQueryGameAndDlcPackageUpdatesAsync( const XStoreContextHandle storeContextHandle,
++                                                             XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreQueryGameAndDlcPackageUpdatesResultCount( XAsyncBlock *async, UINT32 *count ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreQueryGameAndDlcPackageUpdatesResult( XAsyncBlock *async, UINT32 count,
++                                                              XStorePackageUpdate packageUpdates[] ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreDownloadPackageUpdatesAsync( const XStoreContextHandle storeContextHandle,
++                                                      const char **packageIdentifiers, SIZE_T packageIdentifiersCount,
++                                                      XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreDownloadPackageUpdatesResult( XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreDownloadAndInstallPackageUpdatesAsync( const XStoreContextHandle storeContextHandle,
++                                                                const char **packageIdentifiers,
++                                                                SIZE_T packageIdentifiersCount,
++                                                                XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreDownloadAndInstallPackageUpdatesResult( XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreDownloadAndInstallPackagesAsync( const XStoreContextHandle storeContextHandle,
++                                                          const char **storeIds, SIZE_T storeIdsCount,
++                                                          XAsyncBlock *async ) override
++    {
++        FIXME( "ids %s stub!\n", Join( storeIds, storeIdsCount ).c_str() );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreDownloadAndInstallPackagesResultCount( XAsyncBlock *async, UINT32 *count ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreDownloadAndInstallPackagesResult( XAsyncBlock *async, UINT32 count,
++                                                           char **packageIdentifiers ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreQueryPackageIdentifier( const char *storeId, SIZE_T size, char *packageIdentifier ) override
++    {
++        FIXME( "id %s stub!\n", storeId ? storeId : "(null)" );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XStoreRegisterGameLicenseChanged( XStoreContextHandle storeContextHandle, XTaskQueueHandle queue,
++                                                     void *context, XStoreGameLicenseChangedCallback *callback,
++                                                     XTaskQueueRegistrationToken *token ) override
++    {
++        /* The license does not change during a session. */
++        if ( !storeContextHandle || !callback ) return E_INVALIDARG;
++        if ( !token ) return E_POINTER;
++        token->token = ++nextToken;
++        return S_OK;
++    }
++
++    BOOLEAN WINAPI XStoreUnregisterGameLicenseChanged( XStoreContextHandle storeContextHandle,
++                                                       XTaskQueueRegistrationToken token, BOOLEAN wait ) override
++    {
++        return TRUE;
++    }
++
++    HRESULT WINAPI XStoreRegisterPackageLicenseLost( XStoreLicenseHandle licenseHandle, XTaskQueueHandle queue,
++                                                     void *context, XStorePackageLicenseLostCallback *callback,
++                                                     XTaskQueueRegistrationToken *token ) override
++    {
++        FIXME( "stub!\n" );
++        return E_NOTIMPL;
++    }
++
++    BOOLEAN WINAPI XStoreUnregisterPackageLicenseLost( XStoreLicenseHandle licenseHandle,
++                                                       XTaskQueueRegistrationToken token, BOOLEAN wait ) override
++    {
++        FIXME( "stub!\n" );
++        return FALSE;
++    }
++
++    /* IXStoreImpl2 */
++    BOOLEAN WINAPI XStoreIsAvailabilityPurchasable( const XStoreAvailability availability ) override
++    {
++        FIXME( "stub!\n" );
++        return FALSE;
++    }
++
++    /* IXStoreImpl3 */
++    HRESULT WINAPI XStoreAcquireLicenseForDurablesAsync( const XStoreContextHandle storeContextHandle,
++                                                         const char *storeId, XAsyncBlock *async ) override
++    {
++        FIXME( "id %s stub!\n", storeId ? storeId : "(null)" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreAcquireLicenseForDurablesResult( XAsyncBlock *async,
++                                                          XStoreLicenseHandle *storeLicenseHandle ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    /* IXStoreImpl4 */
++    HRESULT WINAPI XStoreShowAssociatedProductsUIAsync( const XStoreContextHandle storeContextHandle,
++                                                        const char *storeId, XStoreProductKind productKinds,
++                                                        XAsyncBlock *async ) override
++    {
++        FIXME( "id %s, kinds %#x stub!\n", storeId ? storeId : "(null)", static_cast<UINT32>(productKinds) );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreShowAssociatedProductsUIResult( XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreShowProductPageUIAsync( const XStoreContextHandle storeContextHandle, const char *storeId,
++                                                 XAsyncBlock *async ) override
++    {
++        FIXME( "id %s stub!\n", storeId ? storeId : "(null)" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreShowProductPageUIResult( XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    /* IXStoreImpl5 */
++    HRESULT WINAPI XStoreQueryAssociatedProductsForStoreIdAsync( const XStoreContextHandle storeContextHandle,
++                                                                 const char *storeId, XStoreProductKind productKinds,
++                                                                 UINT32 maxItemsToRetrievePerPage,
++                                                                 XAsyncBlock *async ) override
++    {
++        FIXME( "id %s, kinds %#x, page %u stub!\n", storeId ? storeId : "(null)", static_cast<UINT32>(productKinds),
++               maxItemsToRetrievePerPage );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreQueryAssociatedProductsForStoreIdResult( XAsyncBlock *async,
++                                                                  XStoreProductQueryHandle *productQueryHandle ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreQueryPackageUpdatesAsync( XStoreContextHandle storeContextHandle,
++                                                   const char **packageIdentifiers, SIZE_T packageIdentifiersCount,
++                                                   XAsyncBlock *async ) override
++    {
++        FIXME( "packages %s stub!\n", Join( packageIdentifiers, packageIdentifiersCount ).c_str() );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreQueryPackageUpdatesResultCount( XAsyncBlock *async, UINT32 *count ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    HRESULT WINAPI XStoreQueryPackageUpdatesResult( XAsyncBlock *async, UINT32 count,
++                                                    XStorePackageUpdate packageUpdates[] ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++    /* IXStoreImpl6 */
++    HRESULT WINAPI XStoreShowGiftingUIAsync( XStoreContextHandle storeContextHandle, const char *storeId,
++                                             const char *name, const char *extendedJsonData,
++                                             XAsyncBlock *async ) override
++    {
++        FIXME( "id %s stub!\n", storeId ? storeId : "(null)" );
++        return FailAsync( async );
++    }
++
++    HRESULT WINAPI XStoreShowGiftingUIResult( XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return FailedResult( async );
++    }
++
++private:
++    std::atomic_long ref{ 1 };
++    std::atomic<UINT64> nextToken{ 0 };
++};
++
++static XStoreImpl g_x_store;
++
++IXStoreImpl6 *x_store = static_cast<IXStoreImpl6 *>(&g_x_store);
+diff --git a/src/System/XUser.cpp b/src/System/XUser.cpp
+index c2ebccd31dba793e25e2c98e99a17322c07ee3ee..0c7afeded1ce05b158bd9b3036f823bbe457ab9c 100644
+--- a/src/System/XUser.cpp
++++ b/src/System/XUser.cpp
+@@ -27,6 +27,7 @@
+ #include "../Xodus/Structs.hpp"
+ #include "GameConfig.h"
+ #include "XboxLive.h"
++#include "XUser.h"
+ 
+ #include <private/IXAsync.hpp>
+ #include <winstring.h>
+@@ -469,6 +470,30 @@ static HRESULT ComputeTokenAndSignature( TokenContext *context )
+                                  context->request, context->forceRefresh, &context->token, &context->signature );
+ }
+ 
++HRESULT XUserTokenForRequest( const char *method, const char *url, const std::string &body, std::string *token,
++                              std::string *signature )
++{
++    TokenContext context;
++    HRESULT hr;
++
++    {
++        const std::lock_guard<std::mutex> lock( usersLock );
++        if ( !signedInUser ) return E_GAMEUSER_NO_DEFAULT_USER;
++        AddRef( signedInUser );
++        context.user = signedInUser;
++    }
++    context.request.method = method;
++    context.request.url = url;
++    context.request.body.assign( body.begin(), body.end() );
++    if ( SUCCEEDED( hr = ComputeTokenAndSignature( &context ) ) )
++    {
++        *token = std::move( context.token );
++        *signature = std::move( context.signature );
++    }
++    Release( context.user );
++    return hr;
++}
++
+ /* The result: the structure, then the token and the signature, each with a terminating NUL that
+  * the sizes count (as Xal documents). A request that is not signed has a null signature. */
+ static SIZE_T TokenResultSize( const TokenContext &context )
+diff --git a/src/System/XUser.h b/src/System/XUser.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8e087f390b89f31971ea4e28b67dae6cec04bb7
+--- /dev/null
++++ b/src/System/XUser.h
+@@ -0,0 +1,35 @@
++/*
++ * Xbox Game runtime Library
++ *  XUser: what the rest of the runtime uses of it
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __XGAMERUNTIME_XUSER_H__
++#define __XGAMERUNTIME_XUSER_H__
++
++#include "../private.h"
++
++#include <string>
++
++/* The signed-in user's token and signature (empty when the request is not signed) for a request
++ * the runtime makes itself, by the NSAL, as XUserGetTokenAndSignature gives them.
++ * E_GAMEUSER_NO_DEFAULT_USER when nobody signed in. Blocks: call it from a task queue. */
++HRESULT XUserTokenForRequest( const char *method, const char *url, const std::string &body, std::string *token,
++                              std::string *signature );
++
++#endif
+diff --git a/src/System/XboxLive.cpp b/src/System/XboxLive.cpp
+index dfb42796cf215d9f100a9cdefa0987e19ef002ea..23fe67c52e7ce73a4e871d15c1021a5340c2f5c9 100644
+--- a/src/System/XboxLive.cpp
++++ b/src/System/XboxLive.cpp
+@@ -141,6 +141,9 @@ static HRESULT HttpAttempt( const wchar_t *method, const wchar_t *host, const wc
+                                    WINHTTP_NO_PROXY_BYPASS, 0 ) );
+     if ( !session.get() ) return fail();
+     WinHttpSetTimeouts( session.get(), 10000, 10000, 20000, 20000 );
++    /* The Store compresses large answers whether asked to or not. */
++    DWORD decompression = WINHTTP_DECOMPRESSION_FLAG_ALL;
++    WinHttpSetOption( session.get(), WINHTTP_OPTION_DECOMPRESSION, &decompression, sizeof(decompression) );
+ 
+     Internet connection( WinHttpConnect( session.get(), host, INTERNET_DEFAULT_HTTPS_PORT, 0 ) );
+     if ( !connection.get() ) return fail();
+@@ -543,6 +546,112 @@ HRESULT RequestNsal( const std::wstring &path, const std::wstring &headers, Nsal
+     return ParseNsal( response, nsal );
+ }
+ 
++static HRESULT GetObject( IJsonObject *object, const wchar_t *name, IJsonObject **out )
++{
++    String key;
++    HRESULT hr;
++
++    if ( FAILED( hr = MakeString( name, &key ) ) ) return hr;
++    return object->GetNamedObject( key.get(), out );
++}
++
++static double GetDouble( IJsonObject *object, const wchar_t *name )
++{
++    DOUBLE value = 0;
++    GetNumber( object, name, &value );
++    return value;
++}
++
++HRESULT QueryStoreAddOns( const char *productId, const char *market, const char *locale, UINT32 skip, UINT32 count,
++                          std::vector<StoreAddOn> *addOns, UINT32 *total )
++{
++    char path[256];
++    std::string response;
++    Ref<IJsonObject> object, payload;
++    Ref<IJsonArray> list;
++    DWORD status = 0;
++    HRESULT hr;
++
++    snprintf( path, sizeof(path),
++              "/v9.0/products/%s/addons?market=%s&locale=%s&deviceFamily=Windows.Desktop&pageSize=%u&skipItems=%u",
++              productId, market, locale, count, skip );
++    if ( FAILED( hr = HttpRequest( L"GET", L"storeedgefd.dsx.mp.microsoft.com", Widen( path ).c_str(),
++                                   L"Accept: application/json\r\n", std::string(), &status, &response ) ) )
++        return hr;
++    if ( status != 200 )
++    {
++        WARN( "Store add-ons failed: HTTP %lu.\n", status );
++        return E_GAMESTORE_SERVER_ERROR;
++    }
++    if ( FAILED( hr = ParseObject( response, &object ) ) || FAILED( hr = GetObject( object.get(), L"Payload", &payload ) ) )
++        return hr;
++    *total = (UINT32)GetDouble( payload.get(), L"TotalItems" );
++    addOns->clear();
++    if ( FAILED( GetArray( payload.get(), L"AddOns", &list ) ) ) return S_OK;
++
++    for ( UINT32 i = 0;; ++i )
++    {
++        Ref<IJsonObject> entry;
++        Ref<IJsonArray> skus;
++        StoreAddOn addOn;
++
++        if ( ( hr = list->GetObjectAt( i, &entry ) ) == E_BOUNDS ) break;
++        if ( FAILED( hr ) ) return hr;
++        if ( FAILED( GetString( entry.get(), L"ProductId", &addOn.productId ) ) ) continue;
++        GetString( entry.get(), L"Title", &addOn.title );
++        GetString( entry.get(), L"Description", &addOn.description );
++        GetString( entry.get(), L"ProductType", &addOn.type );
++        GetString( entry.get(), L"DisplayPrice", &addOn.displayPrice );
++        addOn.price = GetDouble( entry.get(), L"Price" );
++        if ( FAILED( GetArray( entry.get(), L"Skus", &skus ) ) ) skus.reset();
++        for ( UINT32 j = 0; skus.get(); ++j )
++        {
++            Ref<IJsonObject> skuEntry;
++            StoreSku sku;
++
++            if ( FAILED( skus->GetObjectAt( j, &skuEntry ) ) ) break;
++            GetString( skuEntry.get(), L"SkuId", &sku.skuId );
++            GetString( skuEntry.get(), L"SkuTitle", &sku.title );
++            GetString( skuEntry.get(), L"SkuType", &sku.type );
++            GetString( skuEntry.get(), L"AvailabilityId", &sku.availabilityId );
++            GetString( skuEntry.get(), L"DisplayPrice", &sku.displayPrice );
++            GetString( skuEntry.get(), L"CurrencyCode", &sku.currencyCode );
++            sku.price = GetDouble( skuEntry.get(), L"Price" );
++            addOn.skus.push_back( std::move( sku ) );
++        }
++        addOns->push_back( std::move( addOn ) );
++    }
++    return S_OK;
++}
++
++std::string StoreIdKeyRequestBody( const char *serviceTicket, const char *publisherUserId )
++{
++    std::string body = "{\"serviceTicket\":\"" + JsonEscape( serviceTicket ) + "\"";
++    if ( publisherUserId && *publisherUserId ) body += ",\"publisherUserId\":\"" + JsonEscape( publisherUserId ) + "\"";
++    return body + "}";
++}
++
++HRESULT RequestStoreIdKey( const wchar_t *host, const wchar_t *path, const std::string &body,
++                           const std::string &authorization, const std::string &signature, std::string *key )
++{
++    std::wstring headers = L"Content-Type: application/json\r\nAccept: application/json\r\nAuthorization: " +
++                           Widen( authorization ) + L"\r\n";
++    Ref<IJsonObject> object;
++    std::string response;
++    DWORD status = 0;
++    HRESULT hr;
++
++    if ( !signature.empty() ) headers += L"Signature: " + Widen( signature ) + L"\r\n";
++    if ( FAILED( hr = HttpRequest( L"POST", host, path, headers, body, &status, &response ) ) ) return hr;
++    if ( status != 200 )
++    {
++        WARN( "Store ID key from %s: HTTP %lu.\n", Narrow( host ).c_str(), status );
++        return status == 401 || status == 403 ? E_ACCESSDENIED : E_GAMESTORE_SERVER_ERROR;
++    }
++    if ( FAILED( hr = ParseObject( response, &object ) ) ) return hr;
++    return GetString( object.get(), L"key", key );
++}
++
+ HRESULT SignRequest( const ProofKey &key, const SignaturePolicy &policy, const char *method,
+                      const std::string &pathAndQuery, const std::string &authorization,
+                      const HttpHeaders &headers, const BYTE *body, SIZE_T bodySize, std::string *signature )
+diff --git a/src/System/XboxLive.h b/src/System/XboxLive.h
+index 2c2f31405dc79d75c5b2b07273430a83fa5ab8b6..625335ebc5fbbda05b523e759fe40e271f0b6d07 100644
+--- a/src/System/XboxLive.h
++++ b/src/System/XboxLive.h
+@@ -28,6 +28,7 @@
+ #include <bcrypt.h>
+ #include <winstring.h>
+ #include <string>
++#include <vector>
+ 
+ namespace XboxLive
+ {
+@@ -106,6 +107,36 @@ HRESULT RequestXstsToken( const std::string &userToken, const ProofKey &key, con
+ /* title.mgt.xboxlive.com: an NSAL, with the headers the request needs (none for the default one). */
+ HRESULT RequestNsal( const std::wstring &path, const std::wstring &headers, Nsal *nsal );
+ 
++/* A title's add-on in the Store's public catalog, in the Store's terms. */
++struct StoreSku
++{
++    std::string skuId, title, type, availabilityId, displayPrice, currencyCode;
++    double price = 0;
++};
++
++struct StoreAddOn
++{
++    std::string productId, title, description, type, displayPrice; /* type: "Durable", "UnmanagedConsumable"... */
++    double price = 0;
++    std::vector<StoreSku> skus;
++};
++
++/* storeedgefd.dsx.mp.microsoft.com: a page of a title's add-ons (at most 25) in a market and
++ * locale ("IT", "it-IT"), and how many there are in all. Public: no token. The Store leaves out
++ * the add-ons not on sale there, so a page can hold fewer. */
++HRESULT QueryStoreAddOns( const char *productId, const char *market, const char *locale, UINT32 skip, UINT32 count,
++                          std::vector<StoreAddOn> *addOns, UINT32 *total );
++
++/* The body of a Microsoft Store ID key request: the title service's ticket and, optionally, its
++ * id for the user. */
++std::string StoreIdKeyRequestBody( const char *serviceTicket, const char *publisherUserId );
++
++/* collections.mp.microsoft.com/v7.0/beneficiaries/me/keys or purchase.mp.microsoft.com/v7.0/users/me/keys:
++ * a Microsoft Store ID key (User Collections ID or User Purchase ID) with which the title's
++ * services can see or change the user's Store entitlements, for the signed request body. */
++HRESULT RequestStoreIdKey( const wchar_t *host, const wchar_t *path, const std::string &body,
++                           const std::string &authorization, const std::string &signature, std::string *key );
++
+ /* The Signature header for a request under a version 1 ES256 policy, signed now with the key;
+  * E_NOTIMPL for other policies. */
+ HRESULT SignRequest( const ProofKey &key, const SignaturePolicy &policy, const char *method,
+diff --git a/src/main.cpp b/src/main.cpp
+index 4130402edc591b8f9f505aac860ce9e2ea6065b6..aee48737e95c8f2b72f35860f2434188861e6caa 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -140,6 +140,8 @@ HRESULT WINAPI QueryApiImpl( REFCLSID clsid, REFIID iid, void **out )
+         return x_networking->QueryInterface( iid, out );
+     if ( IsEqualGUID( clsid, CLSID_XUserImpl ) )
+         return x_user->QueryInterface( iid, out );
++    if ( IsEqualGUID( clsid, CLSID_XStoreImpl ) )
++        return x_store->QueryInterface( iid, out );
+ 
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &clsid ) );
+     return E_NOINTERFACE;
+diff --git a/src/private.h b/src/private.h
+index e1ba8d7862b4dc160dde2bed3f5fda7e0016b742..86e8d238c610664d89849bcedbef273b0b779b2a 100644
+--- a/src/private.h
++++ b/src/private.h
+@@ -53,6 +53,7 @@
+ #include <xerror.h>
+ #include <xnetworking.h>
+ #include <xuser.h>
++#include <xstore.h>
+ #include <xasync.h>
+ #include <xasyncprovider.h>
+ #include <xtaskqueue.h>
+@@ -84,6 +85,7 @@ extern IXSystemAnalyticsImpl *x_system_analytics;
+ extern IXErrorImpl *x_error;
+ extern IXNetworkingImpl2 *x_networking;
+ extern IXUserImpl6 *x_user;
++extern IXStoreImpl6 *x_store;
+ 
+ #ifdef __cplusplus
+ /* Pass an error to the title's XErrorSetCallback() callback and options. */
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 9ad54259f69846bea94e12f2bbb2082c119f7ec0..80e563684773d9dca455672de5ba8659b4541b90 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -7,6 +7,7 @@ add_executable(test_xgameruntime
+         System/test_xnetworking.cpp
+         System/test_xsystem.cpp
+         System/test_xthreading.cpp
++        System/test_xstore.cpp
+         System/test_xuser.cpp
+         test_fixtures.cpp)
+ 
+diff --git a/tests/System/test_xstore.cpp b/tests/System/test_xstore.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8c7cc9cfacc20db7a8d737d424a3f2b44f53f5c
+--- /dev/null
++++ b/tests/System/test_xstore.cpp
+@@ -0,0 +1,181 @@
++/*
++ * Tests for XStore
++ *
++ * XStoreTests run anywhere: the tests' MicrosoftGame.config names no Store id. XStoreLiveTests
++ * ask for the real game license and run only with XGR_LIVE_XBOX=1, an Xodus service
++ * (XODUS_SOCKET) whose account owns the title, and the title's own MicrosoftGame.config beside
++ * the executable. They print no personal data.
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "../test_fixtures.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <windows.h>
++#include <xasync.h>
++#include <xgameerr.h>
++#include <xstore.h>
++
++class XStoreTests : public XGameRuntimeTests
++{
++};
++
++TEST_F(XStoreTests, ContextsAreChecked)
++{
++    XStoreContextHandle context = nullptr;
++    XAsyncBlock block{};
++
++    EXPECT_EQ(XStoreCreateContext(nullptr, nullptr), E_POINTER);
++    ASSERT_HRESULT_SUCCEEDED(XStoreCreateContext(nullptr, &context));
++    EXPECT_NE(context, nullptr);
++    EXPECT_EQ(XStoreQueryGameLicenseAsync(nullptr, &block), E_INVALIDARG);
++    EXPECT_EQ(XStoreQueryGameLicenseAsync(context, nullptr), E_POINTER);
++    XStoreCloseContextHandle(context);
++}
++
++// Titles wait for the completion even of a call that cannot succeed (Minecraft stops loading):
++// it has to come.
++TEST_F(XStoreTests, GameLicenseNeedsAStoreId)
++{
++    XStoreContextHandle context = nullptr;
++    XStoreGameLicense license{};
++    XAsyncBlock block{};
++
++    ASSERT_HRESULT_SUCCEEDED(XStoreCreateContext(nullptr, &context));
++    ASSERT_HRESULT_SUCCEEDED(XStoreQueryGameLicenseAsync(context, &block));
++    EXPECT_EQ(XAsyncGetStatus(&block, TRUE), E_GAMEPACKAGE_NO_STORE_ID);
++    EXPECT_EQ(XStoreQueryGameLicenseResult(&block, &license), E_GAMEPACKAGE_NO_STORE_ID);
++    XStoreCloseContextHandle(context);
++}
++
++TEST_F(XStoreTests, UnimplementedCallsComplete)
++{
++    XStoreContextHandle context = nullptr;
++    XStoreProductQueryHandle query = nullptr;
++    XAsyncBlock block{};
++
++    ASSERT_HRESULT_SUCCEEDED(XStoreCreateContext(nullptr, &context));
++    ASSERT_HRESULT_SUCCEEDED(XStoreQueryProductForCurrentGameAsync(context, &block));
++    EXPECT_EQ(XAsyncGetStatus(&block, TRUE), E_NOTIMPL);
++    EXPECT_EQ(XStoreQueryProductForCurrentGameResult(&block, &query), E_NOTIMPL);
++    XStoreCloseContextHandle(context);
++}
++
++static BOOLEAN CALLBACK CountProduct( const XStoreProduct *product, void *context )
++{
++    ++*static_cast<int *>(context);
++    return TRUE;
++}
++
++// The associated products come from the title's Store id, which the tests' configuration lacks.
++TEST_F(XStoreTests, AssociatedProductsNeedAStoreId)
++{
++    XStoreContextHandle context = nullptr;
++    XStoreProductQueryHandle query = nullptr;
++    XAsyncBlock block{};
++
++    ASSERT_HRESULT_SUCCEEDED(XStoreCreateContext(nullptr, &context));
++    ASSERT_HRESULT_SUCCEEDED(XStoreQueryAssociatedProductsAsync(context, XStoreProductKind::Durable, 25, &block));
++    EXPECT_EQ(XAsyncGetStatus(&block, TRUE), E_GAMEPACKAGE_NO_STORE_ID);
++    EXPECT_EQ(XStoreQueryAssociatedProductsResult(&block, &query), E_GAMEPACKAGE_NO_STORE_ID);
++    EXPECT_EQ(query, nullptr);
++    XStoreCloseContextHandle(context);
++}
++
++class XStoreLiveTests : public XGameRuntimeTests
++{
++protected:
++    void SetUp() override
++    {
++        const char *live = getenv("XGR_LIVE_XBOX");
++        if (!live || strcmp(live, "1")) GTEST_SKIP() << "set XGR_LIVE_XBOX=1 to ask for the real license";
++    }
++};
++
++struct ProductSearch
++{
++    int products = 0;
++    std::string realmsPrice;
++};
++
++static BOOLEAN CALLBACK FindRealmsPlus( const XStoreProduct *product, void *context )
++{
++    auto *search = static_cast<ProductSearch *>(context);
++
++    ++search->products;
++    if ( strstr( product->title, "Realms Plus Monthly" ) && !strstr( product->title, "trial" ) && product->skusCount )
++        search->realmsPrice = std::string( product->price.formattedPrice ) + " " + product->price.currencyCode;
++    return TRUE;
++}
++
++// The title's add-ons, from the Store's public catalog, page by page (Minecraft: 225, 25 a page).
++TEST_F(XStoreLiveTests, AssociatedProductsComeFromTheCatalog)
++{
++    XStoreContextHandle context = nullptr;
++    XStoreProductQueryHandle query = nullptr;
++    ProductSearch search;
++    XAsyncBlock block{};
++    int pages = 0;
++
++    ASSERT_HRESULT_SUCCEEDED(XStoreCreateContext(nullptr, &context));
++    ASSERT_HRESULT_SUCCEEDED(XStoreQueryAssociatedProductsAsync(
++        context, static_cast<XStoreProductKind>(0x1f), 25, &block));
++    ASSERT_HRESULT_SUCCEEDED(XAsyncGetStatus(&block, TRUE));
++    ASSERT_HRESULT_SUCCEEDED(XStoreQueryAssociatedProductsResult(&block, &query));
++    for ( ;; )
++    {
++        ++pages;
++        ASSERT_HRESULT_SUCCEEDED(XStoreEnumerateProductsQuery(query, &search, FindRealmsPlus));
++        if ( !XStoreProductsQueryHasMorePages(query) ) break;
++        XAsyncBlock next{};
++        XStoreProductQueryHandle nextQuery = nullptr;
++        ASSERT_HRESULT_SUCCEEDED(XStoreProductsQueryNextPageAsync(query, &next));
++        ASSERT_HRESULT_SUCCEEDED(XAsyncGetStatus(&next, TRUE));
++        ASSERT_HRESULT_SUCCEEDED(XStoreProductsQueryNextPageResult(&next, &nextQuery));
++        XStoreCloseProductsQueryHandle(query);
++        query = nextQuery;
++    }
++    XStoreCloseProductsQueryHandle(query);
++    std::printf("[   LIVE   ] associated products: %d in %d pages; Realms Plus monthly: %s\n", search.products, pages,
++                search.realmsPrice.c_str());
++    EXPECT_GT(search.products, 0);
++    EXPECT_GT(pages, 1);
++    EXPECT_FALSE(search.realmsPrice.empty());
++    XStoreCloseContextHandle(context);
++}
++
++TEST_F(XStoreLiveTests, GameLicenseIsTheAccounts)
++{
++    XStoreContextHandle context = nullptr;
++    XStoreGameLicense license{};
++    XAsyncBlock block{};
++
++    ASSERT_HRESULT_SUCCEEDED(XStoreCreateContext(nullptr, &context));
++    ASSERT_HRESULT_SUCCEEDED(XStoreQueryGameLicenseAsync(context, &block));
++    ASSERT_HRESULT_SUCCEEDED(XAsyncGetStatus(&block, TRUE));
++    ASSERT_HRESULT_SUCCEEDED(XStoreQueryGameLicenseResult(&block, &license));
++    std::printf("[   LIVE   ] game license: active %d, trial %d, sku %s\n", license.isActive, license.isTrial,
++                license.skuStoreId);
++    EXPECT_TRUE(license.isActive);
++    EXPECT_FALSE(license.isTrial);
++    EXPECT_NE(strchr(license.skuStoreId, '/'), nullptr); // "<product id>/<sku id>"
++    XStoreCloseContextHandle(context);
++}

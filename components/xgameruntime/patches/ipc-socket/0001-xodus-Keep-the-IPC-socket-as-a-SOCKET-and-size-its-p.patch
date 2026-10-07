@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:21:07 +0200
+Subject: [PATCH] xodus: Keep the IPC socket as a SOCKET and size its path
+ buffer correctly.
+
+sockfd was declared HANDLE but holds the SOCKET socket() returns, which C++ rejects, so
+IPCLayer.cpp did not build. Keep it a SOCKET with INVALID_SOCKET as the unconnected value, close
+it when connect() fails, and report WSAGetLastError() rather than errno. When socket() fails (a
+Wine without AF_UNIX support) return STATUS_NOT_SUPPORTED: STATUS_ABANDONED is a success code to
+FAILED(), and the caller went on with an invalid socket.
+
+The socket path buffer had no room for the terminating NUL, and snprintf() was given a size one
+byte larger than the buffer; size it for the separator and the NUL, and free it once copied.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: ipc-socket
+---
+ src/Xodus/IPCLayer.cpp | 28 +++++++++++++++++-----------
+ 1 file changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/src/Xodus/IPCLayer.cpp b/src/Xodus/IPCLayer.cpp
+index 727a10851cdc6b8063dff9b00c03f3cfab348e1e..6d0f62af955dffc6dca02bcd86ea93a47466d6d2 100644
+--- a/src/Xodus/IPCLayer.cpp
++++ b/src/Xodus/IPCLayer.cpp
+@@ -40,7 +40,7 @@ using namespace ABI::Windows::Foundation;
+ using namespace ABI::Windows::Storage::Streams;
+ using namespace ::Windows::Storage::Streams;
+ 
+-static HANDLE sockfd = nullptr;
++static SOCKET sockfd = INVALID_SOCKET;
+ 
+ LPSTR NormalizeUnixPathToWine( LPCSTR unix_path )
+ {
+@@ -261,26 +261,32 @@ private:
+ 
+         WSAStartup( MAKEWORD( 2, 2 ), &wsa );
+ 
+-        size_t len = strlen( runtime ) + strlen( socket_suffix ) + 1;
++        /* runtime, the separator, socket_suffix and the terminating NUL. */
++        size_t len = strlen( runtime ) + strlen( socket_suffix ) + 2;
+         LPSTR socket_path = (LPSTR)malloc( len );
+ 
+         if ( !socket_path )
+             return STATUS_NO_MEMORY;
+ 
+-        snprintf( socket_path, len + 1, "%s\\%s", runtime, socket_suffix );
+-
+-        sockfd = socket( AF_UNIX, SOCK_STREAM, 0 );
+-        if ( sockfd == INVALID_SOCKET )
+-            return STATUS_ABANDONED;
++        snprintf( socket_path, len, "%s\\%s", runtime, socket_suffix );
+ 
+         memset( &addr, 0, sizeof(addr) );
+         addr.sun_family = AF_UNIX;
+         lstrcpynA( addr.sun_path, socket_path, sizeof(addr.sun_path) - 1 );
++        free( socket_path );
+ 
+-        if ( connect( sockfd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr) ) < 0 )
++        sockfd = socket( AF_UNIX, SOCK_STREAM, 0 );
++        if ( sockfd == INVALID_SOCKET )
+         {
+-            TRACE( "failed to load socket %s\n", socket_path );
+-            TRACE( "socket connection failed with %d\n", errno );
++            TRACE( "cannot create an AF_UNIX socket: error %d\n", WSAGetLastError() );
++            return STATUS_NOT_SUPPORTED;
++        }
++
++        if ( connect( sockfd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr) ) == SOCKET_ERROR )
++        {
++            TRACE( "failed to connect to socket %s: error %d\n", addr.sun_path, WSAGetLastError() );
++            closesocket( sockfd );
++            sockfd = INVALID_SOCKET;
+             return STATUS_CONNECTION_REFUSED;
+         }
+ 
+@@ -296,7 +302,7 @@ private:
+ 
+         TRACE( "socket_args %p\n", socket_args );
+ 
+-        if ( !sockfd )
++        if ( sockfd == INVALID_SOCKET )
+             return STATUS_CONNECTION_INVALID;
+ 
+         fds[0].fd = sockfd;

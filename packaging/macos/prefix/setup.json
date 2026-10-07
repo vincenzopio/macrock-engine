@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "revision": 1,
+  "dll_overrides": "mscoree,mshtml=;xgameruntime=n",
+  "game_drive": "g:",
+  "steps": [
+    {
+      "id": "xgameruntime",
+      "copy": "lib/macrock-engine/x86_64-windows/xgameruntime.dll",
+      "to": "drive_c/windows/system32/xgameruntime.dll"
+    },
+    {
+      "id": "winappsdk-1.8",
+      "reg": "share/macrock-engine/prefix/winappsdk-1.8.reg"
+    }
+  ]
+}

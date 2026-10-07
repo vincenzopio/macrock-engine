@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 22:01:37 +0200
+Subject: [PATCH] winemac.drv: Append MACROCK_WINDOW_TITLE_SUFFIX to window
+ titles.
+
+With MACROCK_WINDOW_TITLE_SUFFIX=<text>, non-empty window titles get the text appended, so that
+sessions of the same program can be told apart in the Dock, Mission Control and the Window
+menu.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: window-title
+---
+ dlls/winemac.drv/cocoa_window.m | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/dlls/winemac.drv/cocoa_window.m b/dlls/winemac.drv/cocoa_window.m
+index b9086edd300efd5b012f7a6496beeaaae68b2eac..df2df77097616e35c7c7de6376d1827c1bf3d31b 100644
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -3217,6 +3217,21 @@ void macdrv_set_cocoa_window_state(macdrv_window w,
+     });
+ }
+ 
++/* MACROCK_WINDOW_TITLE_SUFFIX, appended to non-empty window titles: nil when unset, empty or
++ * not valid UTF-8. */
++static NSString* window_title_suffix(void)
++{
++    static NSString* suffix;
++    static dispatch_once_t once;
++
++    dispatch_once(&once, ^{
++        const char* value = getenv("MACROCK_WINDOW_TITLE_SUFFIX");
++        if (value && *value)
++            suffix = [[NSString alloc] initWithUTF8String:value];
++    });
++    return suffix;
++}
++
+ /***********************************************************************
+  *              macdrv_set_cocoa_window_title
+  *
+@@ -3229,11 +3244,14 @@ void macdrv_set_cocoa_window_title(macdrv_window w, const unsigned short* title,
+ {
+     WineWindow* window = (WineWindow*)w;
+     NSString* titleString;
++    NSString* suffix = window_title_suffix();
+ 
+     if (title)
+         titleString = [NSString stringWithCharacters:title length:length];
+     else
+         titleString = @"";
++    if (suffix && [titleString length])
++        titleString = [titleString stringByAppendingString:suffix];
+     OnMainThreadAsync(^{
+         [window setTitle:titleString];
+         if ([window isOrderedIn] && ![window isExcludedFromWindowsMenu])

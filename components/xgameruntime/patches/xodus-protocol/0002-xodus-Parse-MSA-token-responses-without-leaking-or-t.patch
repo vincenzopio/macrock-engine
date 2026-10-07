@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 00:48:26 +0200
+Subject: [PATCH] xodus: Parse MSA token responses without leaking or tracing
+ the token.
+
+xodus-service answers an MSA token request with an empty message when it has no token for the
+client. FromMsaTokenResponseXml() failed on it and the caller reported success with no response;
+return a response with no token instead, and fail on a document that is not an
+MSATokenResponse. The token copies of the response and of the parser, every node content and, on
+errors, the document were leaked. The parser and SendFrame() traced message bodies, which carry
+the user's MSA ticket: trace lengths only, and keep libxml2 from printing parse errors, which
+quote the document.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: xodus-protocol
+---
+ src/Xodus/IPCLayer.cpp        |  3 +-
+ src/Xodus/Structs.hpp         |  2 +-
+ src/Xodus/XodusXMLBuilder.cpp | 70 +++++++++++++++++++----------------
+ 3 files changed, 40 insertions(+), 35 deletions(-)
+
+diff --git a/src/Xodus/IPCLayer.cpp b/src/Xodus/IPCLayer.cpp
+index 3e0f7d9a31b95d92feeace53d53b26405d85e2db..babdb4ec464952b2e0e86f73a8efb78f448a836c 100644
+--- a/src/Xodus/IPCLayer.cpp
++++ b/src/Xodus/IPCLayer.cpp
+@@ -355,12 +355,11 @@ private:
+         UINT32 magic = *reinterpret_cast<UINT32 *>(frame->frame);
+         UINT16 type  = *reinterpret_cast<UINT16 *>(frame->frame + sizeof(UINT32));
+         UINT16 len   = *reinterpret_cast<UINT16 *>(frame->frame + sizeof(UINT32) + sizeof(UINT16));
+-        BYTE* body  = frame->frame + 8;
+ 
++        /* Message bodies carry account tokens: never trace them. */
+         TRACE("magic is %#x\n", magic);
+         TRACE("type is %d\n", type);
+         TRACE("len is %d\n", len);
+-        TRACE("body is %s\n", body);
+ 
+         while ( sent < frame->frameSize )
+         {
+diff --git a/src/Xodus/Structs.hpp b/src/Xodus/Structs.hpp
+index f2c216fff7a7ee8ab426724548e0d42a2e76313b..89c6af446af32d9984dce107fe9fb470f29166a3 100644
+--- a/src/Xodus/Structs.hpp
++++ b/src/Xodus/Structs.hpp
+@@ -104,7 +104,7 @@ class MsaTokenResponse :
+ {
+ public:
+     MsaTokenResponse() = default;
+-    virtual ~MsaTokenResponse() = default;
++    virtual ~MsaTokenResponse() { WindowsDeleteString( Token ); }
+ 
+     MsaTokenResponse(
+         HSTRING token,
+diff --git a/src/Xodus/XodusXMLBuilder.cpp b/src/Xodus/XodusXMLBuilder.cpp
+index 0e4a847c9755addf155ad45cd080737f66453000..afb5d6506d37bea0f13fbd09ec3529e67803c489 100644
+--- a/src/Xodus/XodusXMLBuilder.cpp
++++ b/src/Xodus/XodusXMLBuilder.cpp
+@@ -157,9 +157,8 @@ public:
+     FromMsaTokenResponseXml( LPCSTR xml_string, IMsaTokenResponse **response ) override
+     {
+         INT strLen;
+-        LPSTR str;
+         LPWSTR strW;
+-        HRESULT hr;
++        HRESULT hr = S_OK;
+         HSTRING token = nullptr;
+         DateTime expiry{};
+         LONGLONG expiryUnix;
+@@ -167,50 +166,57 @@ public:
+         xmlDocPtr doc;
+         xmlNodePtr curr_child, root;
+ 
+-        TRACE( "xml_string %s, response %p.\n", xml_string, response );
++        /* The response carries the user's token: never trace it. */
++        TRACE( "xml_string length %d, response %p.\n", lstrlenA( xml_string ), response );
+ 
+-        if ( !( doc = xmlReadMemory( xml_string, lstrlenA( xml_string ), nullptr, nullptr, 0 ) ) ) return E_FAIL;
+-        if ( !( root = xmlDocGetRootElement( doc ) ) )
++        /* xodus-service answers with an empty message when it has no token for the client. */
++        if ( !*xml_string )
++        {
++            *response = new MsaTokenResponse( nullptr, expiry );
++            return S_OK;
++        }
++
++        /* libxml2's error messages quote the document. */
++        if ( !( doc = xmlReadMemory( xml_string, lstrlenA( xml_string ), nullptr, nullptr,
++                                     XML_PARSE_NOERROR | XML_PARSE_NOWARNING | XML_PARSE_NONET ) ) ) return E_FAIL;
++        if ( !( root = xmlDocGetRootElement( doc ) ) || strcmp( reinterpret_cast<LPCSTR>(root->name), "MSATokenResponse" ) )
+         {
+             xmlFreeDoc( doc );
+             return E_FAIL;
+         }
+ 
+-        if ( !strcmp( reinterpret_cast<LPCSTR>(root->name), "MSATokenResponse" ) )
+-            for ( curr_child = root->children; curr_child != nullptr; curr_child = curr_child->next )
++        for ( curr_child = root->children; curr_child != nullptr && SUCCEEDED( hr ); curr_child = curr_child->next )
++        {
++            if ( curr_child->type == XML_ELEMENT_NODE && !token && !strcmp( reinterpret_cast<LPCSTR>(curr_child->name), "Token" ) )
+             {
+-                if ( curr_child->type == XML_ELEMENT_NODE && !strcmp( reinterpret_cast<LPCSTR>(curr_child->name), "Token" ) )
++                if ( !( childContent = xmlNodeGetContent( curr_child ) ) ) continue;
++                strLen = MultiByteToWideChar( CP_UTF8, 0, reinterpret_cast<LPCSTR>(childContent), -1, nullptr, 0 );
++                if ( ( strW = (LPWSTR)CoTaskMemAlloc( strLen * sizeof(WCHAR) ) ) )
+                 {
+-                    childContent = xmlNodeGetContent( curr_child );
+-                    str = (LPSTR)CoTaskMemAlloc( sizeof(CHAR) * ( lstrlenA( reinterpret_cast<LPCSTR>(childContent) ) + 1 ) );
+-                    if ( !str )
+-                        return E_OUTOFMEMORY;
+-
+-                    lstrcpyA( str, reinterpret_cast<LPCSTR>(childContent) );
+-                    strLen = MultiByteToWideChar( CP_UTF8, 0, str, -1, nullptr, 0 );
+-                    strW = (LPWSTR)CoTaskMemAlloc( strLen * sizeof(WCHAR) );
+-                    MultiByteToWideChar( CP_UTF8, 0, str, -1, strW, strLen );
++                    MultiByteToWideChar( CP_UTF8, 0, reinterpret_cast<LPCSTR>(childContent), -1, strW, strLen );
+                     hr = WindowsCreateString( strW, strLen - 1, &token );
+                     CoTaskMemFree( strW );
+-                    CoTaskMemFree( str );
+-                    if ( FAILED( hr ) ) return hr;
+-                }
+-                else if ( curr_child->type == XML_ELEMENT_NODE && !strcmp( reinterpret_cast<LPCSTR>(curr_child->name), "Expiry" ) )
+-                {
+-                    childContent = xmlNodeGetContent( curr_child );
+-                    str = (LPSTR)CoTaskMemAlloc( sizeof(CHAR) * ( lstrlenA( reinterpret_cast<LPCSTR>(childContent) ) + 1 ) );
+-                    if ( !str )
+-                        return E_OUTOFMEMORY;
+-
+-                    lstrcpyA( str, reinterpret_cast<LPCSTR>(childContent) );
+-                    expiryUnix = strtoll( str, nullptr, 10 );
+-                    expiry.UniversalTime = ((INT64)expiryUnix + SEC_TO_UNIX_EPOCH) * WINDOWS_TICK;
+-                    CoTaskMemFree( str );
+                 }
++                else hr = E_OUTOFMEMORY;
++                xmlFree( childContent );
+             }
++            else if ( curr_child->type == XML_ELEMENT_NODE && !strcmp( reinterpret_cast<LPCSTR>(curr_child->name), "Expiry" ) )
++            {
++                if ( !( childContent = xmlNodeGetContent( curr_child ) ) ) continue;
++                expiryUnix = strtoll( reinterpret_cast<LPCSTR>(childContent), nullptr, 10 );
++                expiry.UniversalTime = ((INT64)expiryUnix + SEC_TO_UNIX_EPOCH) * WINDOWS_TICK;
++                xmlFree( childContent );
++            }
++        }
++        xmlFreeDoc( doc );
+ 
++        if ( FAILED( hr ) )
++        {
++            WindowsDeleteString( token );
++            return hr;
++        }
+         *response = new MsaTokenResponse( token, expiry );
+-        xmlFreeDoc( doc );
++        WindowsDeleteString( token );
+         return S_OK;
+     }
+ 

@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: 1JRobertson <214171130+1JRobertson@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 21:06:53 +0200
+Subject: [PATCH] winemac.drv: Export the window-data layout DXMT 0.80 expects.
+
+DXMT 0.80 reads Wine 8.x private window data. Expose that layout through owned client
+surfaces, keeping Wine's own window data private. On Wine 11.17 the surface comes from
+macdrv_CreateClientSurface() and is registered with use_window_client_surface(), which is
+exported to the drivers.
+
+Origin: bedrock-mac (github.com/1JRobertson/bedrock-mac) 43df439,
+patches/standalone-wine-dxmt-abi.patch (LGPL-2.1-or-later).
+
+Topic: dxmt
+---
+ dlls/winemac.drv/window.c | 135 ++++++++++++++++++++++++++++++++++++++
+ include/wine/gdi_driver.h |   1 +
+ 2 files changed, 136 insertions(+)
+
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 2702881ac351a9dcf59c673ea4d0cd47342a7a4a..a49c768e1500f19f901cac31b2e60723043e6268 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -215,6 +215,141 @@ void release_win_data(struct macdrv_win_data *data)
+ }
+ 
+ 
++/* DXMT 0.80 uses Wine 8.x private window data.  Expose that layout through
++ * owned client surfaces, keeping Wine 11.x window internals private. */
++struct dxmt_win_data
++{
++    HWND hwnd;
++    macdrv_window cocoa_window;
++    macdrv_view cocoa_view;
++    macdrv_view client_cocoa_view;
++    struct macdrv_client_surface *surface;
++    struct list entry;
++};
++
++struct dxmt_metal_view
++{
++    macdrv_metal_view view;
++    struct macdrv_client_surface *surface;
++    struct list entry;
++};
++
++static pthread_mutex_t dxmt_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct list dxmt_windows = LIST_INIT(dxmt_windows);
++static struct list dxmt_views = LIST_INIT(dxmt_views);
++
++static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
++{
++    struct macdrv_win_data *inner;
++    struct client_surface *client;
++    struct dxmt_win_data *data;
++
++    if (!(data = calloc(1, sizeof(*data)))) return NULL;
++    if (!(inner = get_win_data(hwnd)))
++    {
++        free(data);
++        return NULL;
++    }
++    data->hwnd = inner->hwnd;
++    data->cocoa_window = inner->cocoa_window;
++    release_win_data(inner);
++
++    /* Surface creation re-enters the window lock; never hold it here. */
++    if (!(client = macdrv_CreateClientSurface(hwnd, 0, FALSE)))
++    {
++        free(data);
++        return NULL;
++    }
++    data->surface = impl_from_client_surface(client);
++    use_window_client_surface(client, TRUE);
++    data->client_cocoa_view = data->surface->cocoa_view;
++    pthread_mutex_lock(&dxmt_mutex);
++    list_add_tail(&dxmt_windows, &data->entry);
++    pthread_mutex_unlock(&dxmt_mutex);
++    return data;
++}
++
++static void dxmt_release_win_data(struct dxmt_win_data *data)
++{
++    if (!data) return;
++    pthread_mutex_lock(&dxmt_mutex);
++    list_remove(&data->entry);
++    pthread_mutex_unlock(&dxmt_mutex);
++    /* A successful Metal view takes this reference until view destruction. */
++    if (data->surface) client_surface_release(&data->surface->client);
++    free(data);
++}
++
++static macdrv_metal_view dxmt_create_metal_view(macdrv_view view, macdrv_metal_device device)
++{
++    struct dxmt_win_data *data;
++    struct dxmt_metal_view *owned;
++
++    if (!(owned = calloc(1, sizeof(*owned)))) return NULL;
++    if (!(owned->view = macdrv_view_create_metal_view(view, device)))
++    {
++        free(owned);
++        return NULL;
++    }
++    pthread_mutex_lock(&dxmt_mutex);
++    LIST_FOR_EACH_ENTRY(data, &dxmt_windows, struct dxmt_win_data, entry)
++    {
++        if (data->client_cocoa_view != view) continue;
++        owned->surface = data->surface;
++        data->surface = NULL;
++        break;
++    }
++    list_add_tail(&dxmt_views, &owned->entry);
++    pthread_mutex_unlock(&dxmt_mutex);
++    return owned->view;
++}
++
++static void dxmt_release_metal_view(macdrv_metal_view view)
++{
++    struct dxmt_metal_view *owned, *next;
++    struct macdrv_client_surface *surface = NULL;
++
++    pthread_mutex_lock(&dxmt_mutex);
++    LIST_FOR_EACH_ENTRY_SAFE(owned, next, &dxmt_views, struct dxmt_metal_view, entry)
++    {
++        if (owned->view != view) continue;
++        surface = owned->surface;
++        list_remove(&owned->entry);
++        free(owned);
++        break;
++    }
++    pthread_mutex_unlock(&dxmt_mutex);
++    macdrv_view_release_metal_view(view);
++    if (surface) client_surface_release(&surface->client);
++}
++
++/* Only the callbacks consumed by DXMT 0.80 are part of this adapter contract. */
++const struct
++{
++    void (*init_display_devices)(BOOL);
++    struct dxmt_win_data *(*get_win_data)(HWND);
++    void (*release_win_data)(struct dxmt_win_data *);
++    macdrv_window (*get_cocoa_window)(HWND, BOOL);
++    macdrv_metal_device (*create_metal_device)(void);
++    void (*release_metal_device)(macdrv_metal_device);
++    macdrv_metal_view (*view_create_metal_view)(macdrv_view, macdrv_metal_device);
++    macdrv_metal_layer (*view_get_metal_layer)(macdrv_metal_view);
++    void (*view_release_metal_view)(macdrv_metal_view);
++    void *on_main_thread;
++} macdrv_functions __attribute__((visibility("default"))) =
++{
++    NULL,
++    dxmt_get_win_data,
++    dxmt_release_win_data,
++    macdrv_get_cocoa_window,
++    macdrv_create_metal_device,
++    macdrv_release_metal_device,
++    dxmt_create_metal_view,
++    macdrv_view_get_metal_layer,
++    dxmt_release_metal_view,
++    NULL
++};
++
+ /***********************************************************************
+  *              macdrv_get_cocoa_window
+  *
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index 6f8a58dc3dd5660f97e8a432fdcad3b4e04ff4a2..10684e5d757d2bed97550b4fa640dfd39073d56a 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -274,6 +274,7 @@ struct client_surface
+ };
+ 
+ W32KAPI void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd, int format, BOOL raw );
++W32KAPI void use_window_client_surface( struct client_surface *surface, BOOL use );
+ W32KAPI void client_surface_add_ref( struct client_surface *surface );
+ W32KAPI void client_surface_release( struct client_surface *surface );
+ W32KAPI void client_surface_present( struct client_surface *surface );

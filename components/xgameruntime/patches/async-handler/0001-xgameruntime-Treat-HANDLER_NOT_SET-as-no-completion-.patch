@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:26:23 +0200
+Subject: [PATCH] xgameruntime: Treat HANDLER_NOT_SET as no completion handler
+ in XAsync.
+
+completed is HANDLER_NOT_SET, (void *)~0, until put_Completed() sets a handler, but three places
+used it as one: put_Completed() assigned completed to its argument instead of the reverse and
+AddRef()ed the sentinel, the completion callback invoked it, and the last Release() released it.
+Each crashed at 0xffffffffffffffff, as every operation started without a handler did on
+completion. Assign the handler in put_Completed() and skip the sentinel elsewhere, keeping it on
+completion so that a handler set later is still invoked.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: async-handler
+---
+ include/private/IXAsync.hpp | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/include/private/IXAsync.hpp b/include/private/IXAsync.hpp
+index 5ccecfa421ec75aa6a8728f7f82f9b258d3b1482..7fe17e543e5b5eeb4d281f078b4801dddc248a3e 100644
+--- a/include/private/IXAsync.hpp
++++ b/include/private/IXAsync.hpp
+@@ -85,7 +85,7 @@ public:
+ 
+         if ( !curr )
+         {
+-            if ( completed )
++            if ( completed && completed != HANDLER_NOT_SET )
+             {
+                 completed->Release();
+             }
+@@ -145,7 +145,7 @@ public:
+                 return E_ILLEGAL_DELEGATE_ASSIGNMENT;
+ 
+             // Keep the routine alive until invokation.
+-            routine = completed;
++            completed = routine;
+             routine->AddRef();
+ 
+             if ( status > Started )
+@@ -306,7 +306,11 @@ private:
+         {
+             const std::lock_guard<std::mutex> lock( impl->lock );
+             handler = impl->completed;
+-            impl->completed = nullptr;
++            /* Without a handler yet, put_Completed() invokes the one set later. */
++            if ( handler == HANDLER_NOT_SET )
++                handler = nullptr;
++            else
++                impl->completed = nullptr;
+         }
+         if ( handler )
+         {

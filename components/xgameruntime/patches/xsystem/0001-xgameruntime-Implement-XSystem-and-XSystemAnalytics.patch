@@ -1,0 +1,460 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:48:20 +0200
+Subject: [PATCH] xgameruntime: Implement XSystem and XSystemAnalytics.
+
+XSystemGetConsoleId() and XSystemGetXboxLiveSandboxId() answer as on Windows ("00000000...00" and
+"RETAIL"). XSystemGetAppSpecificDeviceId() returns a stable per-device, per-title id: the base64
+of SHA-256 over the prefix's MachineGuid and the title id. XSystemGetAnalyticsInfo() reads
+Windows.System.Profile.AnalyticsInfo, and reports a Windows 10 desktop when WinRT cannot answer:
+titles dereference the result. The handle tracking functions remain stubs.
+
+Ported from WineGDK (LGPL-2.1-or-later); changes are original work for macrock.
+
+Topic: xsystem
+---
+ src/CMakeLists.txt            |   3 +
+ src/System/XSystem.cpp        | 286 ++++++++++++++++++++++++++++++++++
+ src/main.cpp                  |   4 +
+ src/private.h                 |   2 +
+ tests/CMakeLists.txt          |   1 +
+ tests/System/test_xsystem.cpp |  76 +++++++++
+ 6 files changed, 372 insertions(+)
+ create mode 100644 src/System/XSystem.cpp
+ create mode 100644 tests/System/test_xsystem.cpp
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 04b3e6b319b26dcd580c44441e4ec6007c845d1b..832703c578f2900f96eb7b283e48e07893bdabee 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -22,6 +22,7 @@ target_sources(xgameruntime PRIVATE
+         System/GameConfig.cpp
+         System/XGame.cpp
+         System/XGameRuntimeFeature.cpp
++        System/XSystem.cpp
+         System/XThreading.cpp )
+ 
+ # System/Threading (based on libHttpClient)
+@@ -42,6 +43,8 @@ set_target_properties(xgameruntime PROPERTIES
+ target_link_libraries(xgameruntime PRIVATE
+         xgameruntime-common
+         runtimeobject
++        bcrypt
++        crypt32
+         ws2_32
+         LibXml2 )
+ 
+diff --git a/src/System/XSystem.cpp b/src/System/XSystem.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..17c4cf1e0c220d10ab734ee5e79472d9c3d78d25
+--- /dev/null
++++ b/src/System/XSystem.cpp
+@@ -0,0 +1,286 @@
++/*
++ * Xbox Game runtime Library
++ *  GDK Component: System API -> XSystem, XSystemAnalytics
++ *
++ * Ported from WineGDK's dlls/xgameruntime/GDKComponent/System/XSystem.cpp and
++ * XSystemAnalytics.cpp (LGPL-2.1-or-later); the app-specific device id and the analytics
++ * fallback are new. Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "../private.h"
++#include "GameConfig.h"
++
++#include <bcrypt.h>
++#include <wincrypt.h>
++#include <roapi.h>
++#include <winstring.h>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++using namespace ABI::Windows::System::Profile;
++
++static const INT32 XSystemConsoleIdBytes = 39;
++static const INT32 XSystemXboxLiveSandboxIdMaxBytes = 16;
++static const INT32 XSystemAppSpecificDeviceIdBytes = 45;
++
++/* Copy text and its terminating NUL into buffer, as the XSystem getters do. */
++static HRESULT CopyId( const char *text, INT32 size, char *buffer, SIZE_T *used )
++{
++    SIZE_T length = strlen( text ) + 1;
++
++    if ( !buffer ) return E_POINTER;
++    if ( size < 0 || (SIZE_T)size < length ) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++    memcpy( buffer, text, length );
++    if ( used ) *used = length;
++    return S_OK;
++}
++
++/* A per-device, per-title identifier: base64 of SHA-256 over the Wine prefix's MachineGuid and
++ * the title id, 44 characters. Stable for a title on a device (here, a prefix); titles cannot
++ * derive one another's. */
++static HRESULT MakeAppSpecificDeviceId( char id[XSystemAppSpecificDeviceIdBytes] )
++{
++    char machine[64], input[96];
++    DWORD size = sizeof(machine), length = XSystemAppSpecificDeviceIdBytes;
++    UCHAR digest[32];
++    LSTATUS error;
++    NTSTATUS status;
++
++    error = RegGetValueA( HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Cryptography", "MachineGuid",
++                          RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, machine, &size );
++    if ( error ) return HRESULT_FROM_WIN32( error );
++    snprintf( input, sizeof(input), "%s:%08X", machine, GetGameConfig().titleId );
++
++    status = BCryptHash( BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, (PUCHAR)input, (ULONG)strlen( input ),
++                         digest, sizeof(digest) );
++    if ( !BCRYPT_SUCCESS( status ) ) return HRESULT_FROM_NT( status );
++    if ( !CryptBinaryToStringA( digest, sizeof(digest), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, id, &length ) )
++        return HRESULT_FROM_WIN32( GetLastError() );
++    return S_OK;
++}
++
++class XSystemImpl :
++    public IXSystemImpl5
++{
++public:
++    HRESULT WINAPI QueryInterface( REFIID iid, void **out ) noexcept override
++    {
++        TRACE( "iface %p, iid %s, out %p.\n", this, debugstr_guid( &iid ), out );
++
++        if ( !out ) return E_POINTER;
++        *out = nullptr;
++
++        if ( iid == __uuidof( IUnknown ) ||
++             iid == __uuidof( IXSystemImpl ) ||
++             iid == __uuidof( IXSystemImpl2 ) ||
++             iid == __uuidof( IXSystemImpl3 ) ||
++             iid == __uuidof( IXSystemImpl4 ) ||
++             iid == __uuidof( IXSystemImpl5 ) )
++        {
++            AddRef();
++            *out = static_cast<IXSystemImpl5 *>(this);
++            return S_OK;
++        }
++
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &iid ) );
++        return E_NOINTERFACE;
++    }
++
++    ULONG WINAPI AddRef() noexcept override
++    {
++        return static_cast<ULONG>(++ref);
++    }
++
++    ULONG WINAPI Release() noexcept override
++    {
++        // A static object: never deleted.
++        return static_cast<ULONG>(--ref);
++    }
++
++    HRESULT WINAPI XSystemGetConsoleId( INT32 consoleIdSize, char *consoleId, SIZE_T *consoleIdUsed ) override
++    {
++        TRACE( "consoleIdSize %d, consoleId %p, consoleIdUsed %p.\n", consoleIdSize, consoleId, consoleIdUsed );
++        return CopyId( "00000000.00000000.00000000.00000000.00", consoleIdSize, consoleId, consoleIdUsed );
++    }
++
++    HRESULT WINAPI XSystemGetXboxLiveSandboxId( INT32 sandboxIdSize, char *sandboxId, SIZE_T *sandboxIdUsed ) override
++    {
++        TRACE( "sandboxIdSize %d, sandboxId %p, sandboxIdUsed %p.\n", sandboxIdSize, sandboxId, sandboxIdUsed );
++        if ( sandboxIdSize < XSystemXboxLiveSandboxIdMaxBytes && sandboxId )
++            return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++        return CopyId( "RETAIL", sandboxIdSize, sandboxId, sandboxIdUsed );
++    }
++
++    HRESULT WINAPI XSystemGetAppSpecificDeviceId( INT32 appSpecificDeviceIdSize, char *appSpecificDeviceId,
++                                                  SIZE_T *appSpecificDeviceIdUsed ) override
++    {
++        char id[XSystemAppSpecificDeviceIdBytes];
++        HRESULT hr;
++
++        TRACE( "appSpecificDeviceIdSize %d, appSpecificDeviceId %p, appSpecificDeviceIdUsed %p.\n",
++               appSpecificDeviceIdSize, appSpecificDeviceId, appSpecificDeviceIdUsed );
++
++        if ( !appSpecificDeviceId ) return E_POINTER;
++        if ( appSpecificDeviceIdSize < XSystemAppSpecificDeviceIdBytes )
++            return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++        if ( FAILED( hr = MakeAppSpecificDeviceId( id ) ) )
++        {
++            ERR( "cannot derive the app-specific device id, hr %#lx.\n", hr );
++            return hr;
++        }
++        return CopyId( id, appSpecificDeviceIdSize, appSpecificDeviceId, appSpecificDeviceIdUsed );
++    }
++
++    HRESULT WINAPI XSystemHandleTrack( XSystemHandleCallback callback, void *context ) override
++    {
++        FIXME( "callback %p, context %p stub!\n", callback, context );
++        return E_NOTIMPL;
++    }
++
++    BOOLEAN WINAPI XSystemIsHandleValid( XSystemHandle handle ) override
++    {
++        FIXME( "handle %p stub!\n", handle );
++        return FALSE;
++    }
++
++    void WINAPI XSystemAllowFullDownloadBandwidth( BOOLEAN enable ) override
++    {
++        FIXME( "enable %u stub!\n", enable );
++    }
++
++private:
++    std::atomic_long ref{ 1 };
++};
++
++/* Fill info from Windows.System.Profile.AnalyticsInfo; false when WinRT cannot answer. */
++static bool AnalyticsFromWinRT( XSystemAnalyticsInfo *info )
++{
++    IAnalyticsInfoStatics *statics = nullptr;
++    IAnalyticsVersionInfo *version = nullptr;
++    HSTRING name = nullptr, family = nullptr, familyVersion = nullptr;
++    char text[128], *dot;
++    bool ok = false;
++
++    if ( FAILED( WindowsCreateString( RuntimeClass_Windows_System_Profile_AnalyticsInfo,
++                                      lstrlenW( RuntimeClass_Windows_System_Profile_AnalyticsInfo ), &name ) ) )
++        return false;
++    if ( SUCCEEDED( RoGetActivationFactory( name, __uuidof( IAnalyticsInfoStatics ), (void **)&statics ) ) &&
++         SUCCEEDED( statics->get_VersionInfo( &version ) ) &&
++         SUCCEEDED( version->get_DeviceFamily( &family ) ) &&
++         SUCCEEDED( version->get_DeviceFamilyVersion( &familyVersion ) ) )
++    {
++        /* DeviceFamily is "<family>.<form>", e.g. "Windows.Desktop". */
++        WideCharToMultiByte( CP_UTF8, 0, WindowsGetStringRawBuffer( family, nullptr ), -1, text, sizeof(text),
++                             nullptr, nullptr );
++        if ( ( dot = strchr( text, '.' ) ) )
++        {
++            *dot = '\0';
++            lstrcpynA( info->family, text, sizeof(info->family) );
++            lstrcpynA( info->form, dot + 1, sizeof(info->form) );
++        }
++        /* DeviceFamilyVersion is a decimal 64-bit number, 16 bits per version part. */
++        WideCharToMultiByte( CP_UTF8, 0, WindowsGetStringRawBuffer( familyVersion, nullptr ), -1, text,
++                             sizeof(text), nullptr, nullptr );
++        ULONGLONG packed = strtoull( text, nullptr, 10 );
++        if ( packed && dot )
++        {
++            info->osVersion.major = (UINT16)( packed >> 48 );
++            info->osVersion.minor = (UINT16)( ( packed >> 32 ) & 0xffff );
++            info->osVersion.build = (UINT16)( ( packed >> 16 ) & 0xffff );
++            info->osVersion.revision = (UINT16)( packed & 0xffff );
++            info->hostingOsVersion = info->osVersion;
++            ok = true;
++        }
++    }
++    WindowsDeleteString( familyVersion );
++    WindowsDeleteString( family );
++    WindowsDeleteString( name );
++    if ( version ) version->Release();
++    if ( statics ) statics->Release();
++    return ok;
++}
++
++class XSystemAnalyticsImpl :
++    public IXSystemAnalyticsImpl
++{
++public:
++    HRESULT WINAPI QueryInterface( REFIID iid, void **out ) noexcept override
++    {
++        TRACE( "iface %p, iid %s, out %p.\n", this, debugstr_guid( &iid ), out );
++
++        if ( !out ) return E_POINTER;
++        *out = nullptr;
++
++        if ( iid == __uuidof( IUnknown ) ||
++             iid == __uuidof( IXSystemAnalyticsImpl ) )
++        {
++            AddRef();
++            *out = static_cast<IXSystemAnalyticsImpl *>(this);
++            return S_OK;
++        }
++
++        FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &iid ) );
++        return E_NOINTERFACE;
++    }
++
++    ULONG WINAPI AddRef() noexcept override
++    {
++        return static_cast<ULONG>(++ref);
++    }
++
++    ULONG WINAPI Release() noexcept override
++    {
++        // A static object: never deleted.
++        return static_cast<ULONG>(--ref);
++    }
++
++    /* Returned through a hidden pointer after this, as MSVC-built games expect
++     * (WIDL_EXPLICIT_AGGREGATE_RETURNS). */
++    XSystemAnalyticsInfo *WINAPI XSystemGetAnalyticsInfo( XSystemAnalyticsInfo *__ret ) override
++    {
++        XSystemAnalyticsInfo info{};
++
++        TRACE( "iface %p, __ret %p.\n", this, __ret );
++
++        if ( !AnalyticsFromWinRT( &info ) )
++        {
++            /* What a current Windows 10 desktop reports; the game must always get an answer. */
++            WARN( "Windows.System.Profile.AnalyticsInfo unavailable, reporting Windows.Desktop 10.0.19045.\n" );
++            info = XSystemAnalyticsInfo{};
++            info.osVersion.major = 10;
++            info.osVersion.minor = 0;
++            info.osVersion.build = 19045;
++            info.osVersion.revision = 0;
++            info.hostingOsVersion = info.osVersion;
++            lstrcpynA( info.family, "Windows", sizeof(info.family) );
++            lstrcpynA( info.form, "Desktop", sizeof(info.form) );
++        }
++        *__ret = info;
++        return __ret;
++    }
++
++private:
++    std::atomic_long ref{ 1 };
++};
++
++static XSystemImpl g_x_system;
++static XSystemAnalyticsImpl g_x_system_analytics;
++
++IXSystemImpl5 *x_system = static_cast<IXSystemImpl5 *>(&g_x_system);
++IXSystemAnalyticsImpl *x_system_analytics = static_cast<IXSystemAnalyticsImpl *>(&g_x_system_analytics);
+diff --git a/src/main.cpp b/src/main.cpp
+index d2292dd3f735c21a18e50ab21659e2ae6325d1ac..b5e8cf02047dcdf686c752c31a3b1e5485973c3b 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -130,6 +130,10 @@ HRESULT WINAPI QueryApiImpl( REFCLSID clsid, REFIID iid, void **out )
+     }
+     if ( IsEqualGUID( clsid, CLSID_XGameImpl ) )
+         return x_game->QueryInterface( iid, out );
++    if ( IsEqualGUID( clsid, CLSID_XSystemImpl ) )
++        return x_system->QueryInterface( iid, out );
++    if ( IsEqualGUID( clsid, CLSID_XSystemAnalyticsImpl ) )
++        return x_system_analytics->QueryInterface( iid, out );
+ 
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &clsid ) );
+     return E_NOINTERFACE;
+diff --git a/src/private.h b/src/private.h
+index de3eea2a4dca0ef5c6f9e511fc0f8897ee74ef3c..8f6a14648d30a43cf1b0be0c3d5c98e212ef7bbd 100644
+--- a/src/private.h
++++ b/src/private.h
+@@ -76,6 +76,8 @@
+ extern IXThreadingImpl *x_threading_impl;
+ extern IXGameImpl3 *x_game;
+ extern IXGameRuntimeFeatureImpl *x_game_runtime_feature;
++extern IXSystemImpl5 *x_system;
++extern IXSystemAnalyticsImpl *x_system_analytics;
+ extern IActivationFactory* xodus_ipc_packet_factory;
+ 
+ #ifdef __cplusplus
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 4667e024729505041cb503d86369cd9ca3533492..69176659ea798b44dcb8599aa330b76e5e415a50 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ add_executable(test_xgameruntime
+         System/test_xgame.cpp
+         System/test_xgameruntimefeature.cpp
++        System/test_xsystem.cpp
+         System/test_xthreading.cpp
+         test_fixtures.cpp)
+ 
+diff --git a/tests/System/test_xsystem.cpp b/tests/System/test_xsystem.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..db38df44026e6771e5514b2d3abad7b49bb27025
+--- /dev/null
++++ b/tests/System/test_xsystem.cpp
+@@ -0,0 +1,76 @@
++/*
++ * Tests for XSystem and XSystemAnalytics
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "../test_fixtures.h"
++
++#include <cstring>
++#include <windows.h>
++#include <xsystem.h>
++
++class XSystemTests : public XGameRuntimeTests
++{
++};
++
++TEST_F(XSystemTests, ConsoleIdIsTheWindowsOne)
++{
++    char id[64];
++    SIZE_T used = 0;
++
++    EXPECT_HRESULT_SUCCEEDED(XSystemGetConsoleId(sizeof(id), id, &used));
++    EXPECT_STREQ(id, "00000000.00000000.00000000.00000000.00");
++    EXPECT_EQ(used, 39u);
++    EXPECT_EQ(XSystemGetConsoleId(10, id, &used), HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
++}
++
++TEST_F(XSystemTests, SandboxIsRetail)
++{
++    char id[16];
++    SIZE_T used = 0;
++
++    EXPECT_HRESULT_SUCCEEDED(XSystemGetXboxLiveSandboxId(sizeof(id), id, &used));
++    EXPECT_STREQ(id, "RETAIL");
++    EXPECT_EQ(used, 7u);
++}
++
++TEST_F(XSystemTests, AppSpecificDeviceIdIsStableBase64)
++{
++    char first[45], second[45];
++    SIZE_T used = 0;
++
++    EXPECT_HRESULT_SUCCEEDED(XSystemGetAppSpecificDeviceId(sizeof(first), first, &used));
++    EXPECT_EQ(used, 45u);
++    EXPECT_EQ(std::strlen(first), 44u);
++    EXPECT_EQ(std::strspn(first, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"), 43u);
++    EXPECT_EQ(first[43], '=');
++    EXPECT_HRESULT_SUCCEEDED(XSystemGetAppSpecificDeviceId(sizeof(second), second, nullptr));
++    EXPECT_STREQ(first, second);
++    EXPECT_EQ(XSystemGetAppSpecificDeviceId(44, first, &used), HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER));
++}
++
++TEST_F(XSystemTests, AnalyticsInfoIsAWindowsDesktop)
++{
++    XSystemAnalyticsInfo info = XSystemGetAnalyticsInfo();
++
++    EXPECT_STREQ(info.family, "Windows");
++    EXPECT_STREQ(info.form, "Desktop");
++    EXPECT_EQ(info.osVersion.major, 10);
++    EXPECT_GT(info.osVersion.build, 10000);
++    EXPECT_EQ(info.hostingOsVersion.build, info.osVersion.build);
++}

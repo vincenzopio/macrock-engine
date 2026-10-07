@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 10:47:48 +0200
+Subject: [PATCH] xodus: Ask xodus-service for the account's game license.
+
+XodusRequestGameLicense() sends GAME_LICENSE_REQUEST (100) with a title's Store product id and
+market and reads GAME_LICENSE_RESPONSE (101): whether the license is active, whether it is a
+trial, and its SKU. xodus-service asks the Store's licensing service with the account's Microsoft
+tokens, which only it holds. A service that does not know the request answers with an empty
+message, reported as E_NOTIMPL.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: game-license
+---
+ src/CMakeLists.txt        |   5 +-
+ src/Xodus/GameLicense.cpp | 156 ++++++++++++++++++++++++++++++++++++++
+ src/Xodus/GameLicense.h   |  41 ++++++++++
+ 3 files changed, 200 insertions(+), 2 deletions(-)
+ create mode 100644 src/Xodus/GameLicense.cpp
+ create mode 100644 src/Xodus/GameLicense.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 6d088449b70e4d2f7f818b78f438fe1135f5a070..4b60d7b790566ff528ead28ef99b2e51213d116a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -15,7 +15,8 @@ target_sources(xgameruntime PRIVATE
+         Xodus/Structs.cpp
+         Xodus/IPCLayer.cpp
+         Xodus/XodusService.cpp
+-        Xodus/XodusXMLBuilder.cpp )
++        Xodus/XodusXMLBuilder.cpp
++        Xodus/GameLicense.cpp )
+ 
+ # System
+ target_sources(xgameruntime PRIVATE
+@@ -66,4 +67,4 @@ target_include_directories(xgameruntime
+ 
+ target_compile_features(xgameruntime
+         PUBLIC
+-        cxx_std_23 )
+\ No newline at end of file
++        cxx_std_23 )
+diff --git a/src/Xodus/GameLicense.cpp b/src/Xodus/GameLicense.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e9e592c9346cc13a4d2174aeec8025a95fbe552
+--- /dev/null
++++ b/src/Xodus/GameLicense.cpp
+@@ -0,0 +1,156 @@
++/*
++ * Xbox Game runtime Library
++ *  Xodus: the game license of the signed-in account
++ *
++ * GAME_LICENSE_REQUEST (100) carries <GameLicenseRequest><StoreId/><Market/></...>, and
++ * xodus-service answers GAME_LICENSE_RESPONSE (101) with <GameLicenseResponse> (Result, IsActive,
++ * IsTrial, SkuStoreId), or with an empty message when it does not know the request.
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "GameLicense.h"
++#include "Structs.hpp"
++
++#include <private/IXAsync.hpp>
++
++#include <libxml/parser.h>
++#include <libxml/tree.h>
++#include <winstring.h>
++
++#include <cctype>
++#include <cstring>
++#include <string>
++
++using namespace ABI::Xodus;
++using namespace ABI::Windows::Storage::Streams;
++using namespace ::Windows::Storage::Streams;
++
++static const UINT16 gameLicenseRequestType = 100, gameLicenseResponseType = 101;
++
++/* Store ids and markets are letters, digits and dashes: nothing to escape in XML. */
++static BOOL IsPlain( const char *text )
++{
++    if ( !text || !*text ) return FALSE;
++    for ( const char *c = text; *c; ++c )
++        if ( !isalnum( (unsigned char)*c ) && *c != '-' ) return FALSE;
++    return TRUE;
++}
++
++static HRESULT MakeBuffer( const std::string &text, IBuffer **buffer )
++{
++    IBufferFactory *factory = nullptr;
++    IBufferByteAccess *access = nullptr;
++    HSTRING className = nullptr;
++    BYTE *bytes;
++    HRESULT hr;
++
++    if ( SUCCEEDED( hr = WindowsCreateString( RuntimeClass_Windows_Storage_Streams_Buffer,
++                                              lstrlenW( RuntimeClass_Windows_Storage_Streams_Buffer ), &className ) ) &&
++         SUCCEEDED( hr = RoGetActivationFactory( className, __uuidof( IBufferFactory ), (void **)&factory ) ) &&
++         SUCCEEDED( hr = factory->Create( (UINT32)text.size(), buffer ) ) )
++    {
++        if ( SUCCEEDED( hr = (*buffer)->QueryInterface<IBufferByteAccess>( &access ) ) &&
++             SUCCEEDED( hr = access->Buffer( &bytes ) ) )
++        {
++            memcpy( bytes, text.data(), text.size() );
++            hr = (*buffer)->put_Length( (UINT32)text.size() );
++        }
++        if ( access ) access->Release();
++        if ( FAILED( hr ) )
++        {
++            (*buffer)->Release();
++            *buffer = nullptr;
++        }
++    }
++    if ( factory ) factory->Release();
++    WindowsDeleteString( className );
++    return hr;
++}
++
++static HRESULT ParseReply( const char *xml, XodusGameLicense *license )
++{
++    xmlDocPtr doc;
++    xmlNodePtr root;
++    HRESULT hr = S_OK;
++
++    /* A service without game licenses answers the request with an empty message. */
++    if ( !*xml ) return E_NOTIMPL;
++    if ( !( doc = xmlReadMemory( xml, (int)strlen( xml ), nullptr, nullptr,
++                                 XML_PARSE_NOERROR | XML_PARSE_NOWARNING | XML_PARSE_NONET ) ) )
++        return E_UNEXPECTED;
++    if ( !( root = xmlDocGetRootElement( doc ) ) || strcmp( (const char *)root->name, "GameLicenseResponse" ) )
++    {
++        xmlFreeDoc( doc );
++        return E_UNEXPECTED;
++    }
++
++    for ( xmlNodePtr child = root->children; child; child = child->next )
++    {
++        const char *name = (const char *)child->name;
++        char *value;
++
++        if ( child->type != XML_ELEMENT_NODE || !( value = (char *)xmlNodeGetContent( child ) ) ) continue;
++        if ( !strcmp( name, "Result" ) ) hr = (HRESULT)strtoul( value, nullptr, 10 );
++        else if ( !strcmp( name, "IsActive" ) ) license->isActive = !strcmp( value, "true" );
++        else if ( !strcmp( name, "IsTrial" ) ) license->isTrial = !strcmp( value, "true" );
++        else if ( !strcmp( name, "SkuStoreId" ) ) lstrcpynA( license->skuStoreId, value, sizeof(license->skuStoreId) );
++        xmlFree( value );
++    }
++    xmlFreeDoc( doc );
++    return hr;
++}
++
++HRESULT XodusRequestGameLicense( const char *storeId, const char *market, XodusGameLicense *license )
++{
++    IXAsync<IXodusIPCPacket *> *operation = nullptr;
++    IXodusIPCPacket *packet = nullptr, *reply = nullptr;
++    IBufferByteAccess *access = nullptr;
++    IBuffer *message = nullptr;
++    UINT16 type = 0;
++    BYTE *bytes;
++    HRESULT hr;
++
++    if ( !license || !IsPlain( storeId ) || !IsPlain( market ) ) return E_INVALIDARG;
++    memset( license, 0, sizeof(*license) );
++    std::string xml = std::string( "<GameLicenseRequest><StoreId>" ) + storeId + "</StoreId><Market>" + market +
++                      "</Market></GameLicenseRequest>";
++    if ( FAILED( hr = MakeBuffer( xml, &message ) ) ) return hr;
++    packet = new XodusIPCPacket( MagicHeaderType_XML, gameLicenseRequestType, message ); /* references message */
++    message->Release();
++    message = nullptr;
++
++    if ( SUCCEEDED( hr = xodus_ipclayer->SendRequestAsync( packet, &operation ) ) &&
++         SUCCEEDED( hr = operation->GetResults( TRUE, &reply ) ) &&
++         SUCCEEDED( hr = reply->get_MessageType( &type ) ) )
++    {
++        if ( type != gameLicenseResponseType ) hr = E_UNEXPECTED;
++        /* The IPC layer NUL-terminates received messages. */
++        else if ( SUCCEEDED( hr = reply->get_Message( &message ) ) &&
++                  SUCCEEDED( hr = message->QueryInterface<IBufferByteAccess>( &access ) ) &&
++                  SUCCEEDED( hr = access->Buffer( &bytes ) ) )
++            hr = ParseReply( (const char *)bytes, license );
++    }
++    if ( access ) access->Release();
++    if ( message ) message->Release();
++    if ( reply ) reply->Release();
++    if ( operation ) operation->Release();
++    packet->Release();
++    TRACE( "store id %s: hr %#lx, active %d, trial %d, sku %s.\n", storeId, hr, license->isActive, license->isTrial,
++           license->skuStoreId );
++    return hr;
++}
+diff --git a/src/Xodus/GameLicense.h b/src/Xodus/GameLicense.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f82dbdb876d2f795cc1f0a4aeeaca5577eaf02a
+--- /dev/null
++++ b/src/Xodus/GameLicense.h
+@@ -0,0 +1,41 @@
++/*
++ * Xbox Game runtime Library
++ *  Xodus: the game license of the signed-in account
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __XGAMERUNTIME_XODUS_GAMELICENSE_H__
++#define __XGAMERUNTIME_XODUS_GAMELICENSE_H__
++
++#include "../private.h"
++
++/* What xodus-service found out about the account's license to a title. */
++struct XodusGameLicense
++{
++    BOOLEAN isActive;
++    BOOLEAN isTrial;
++    char skuStoreId[18]; /* "<product id>/<sku id>", empty when unknown */
++};
++
++/* Ask xodus-service, which asks the Store's licensing service with the account's Microsoft
++ * tokens, whether the account may play the title with this Store product id. Blocks until the
++ * reply comes: call it from a task queue. An account without a license succeeds with isActive
++ * FALSE; a failure to find out fails. */
++HRESULT XodusRequestGameLicense( const char *storeId, const char *market, XodusGameLicense *license );
++
++#endif

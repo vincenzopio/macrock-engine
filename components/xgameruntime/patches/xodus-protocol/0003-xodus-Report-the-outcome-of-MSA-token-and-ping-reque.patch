@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 00:48:49 +0200
+Subject: [PATCH] xodus: Report the outcome of MSA token and ping requests.
+
+MsaTokenRequestAsync() returned S_OK whatever happened, so a failed request completed as a
+success with a null response. Return the status, and check the reply's message type before
+parsing it. Both requests released their packet twice, after the reply and on cleanup; release it
+on cleanup only. PingAsync() also ignored a failure to send and returned on a wrong reply type
+without cleaning up.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: xodus-protocol
+---
+ src/Xodus/XodusService.cpp | 29 ++++++++++++++---------------
+ 1 file changed, 14 insertions(+), 15 deletions(-)
+
+diff --git a/src/Xodus/XodusService.cpp b/src/Xodus/XodusService.cpp
+index f252aefd0586f66a7df7ce18acda52561c212255..1acf8c326c7ed4f868624626c8f776aa12948f10 100644
+--- a/src/Xodus/XodusService.cpp
++++ b/src/Xodus/XodusService.cpp
+@@ -149,7 +149,7 @@ private:
+         LPSTR xmlStr = nullptr;
+         UINT16 messageType;
+         HRESULT status = S_OK;
+-        HSTRING bufferClass;
++        HSTRING bufferClass = nullptr;
+ 
+         IMsaTokenResponse *tokenResponse = nullptr;
+         IXodusIPCPacket *xodusPacket = nullptr;
+@@ -199,11 +199,16 @@ private:
+         status = response->GetResults( TRUE, &xodusPacketResult );
+         if ( FAILED( status ) ) goto _CLEANUP;
+ 
+-        xodusPacket->Release();
+         message->Release();
+         message = nullptr;
+ 
+         xodusPacketResult->get_MessageType( &messageType );
++        if ( messageType != 4 /* MsaTokenResponse */ )
++        {
++            status = E_INVALIDARG;
++            goto _CLEANUP;
++        }
++
+         xodusPacketResult->get_Message( &message );
+         status = message->QueryInterface<IBufferByteAccess>( &messageByteAccess );
+         if ( FAILED( status ) ) goto _CLEANUP;
+@@ -211,15 +216,9 @@ private:
+         status = messageByteAccess->Buffer( &messageBuffer );
+         if ( FAILED( status ) ) goto _CLEANUP;
+ 
++        /* The IPC layer NUL-terminates received messages. */
+         status = xodus_xml_builder->FromMsaTokenResponseXml( reinterpret_cast<LPCSTR>(messageBuffer), &tokenResponse );
+-
+-        if ( SUCCEEDED( status ) )
+-        {
+-            *result = tokenResponse;
+-
+-            if ( messageType != 4 /* MsaTokenResponse */ )
+-                status = E_INVALIDARG;
+-        }
++        if ( SUCCEEDED( status ) ) *result = tokenResponse;
+ 
+ _CLEANUP:
+         if ( bufferClass ) WindowsDeleteString( bufferClass );
+@@ -232,7 +231,7 @@ _CLEANUP:
+         if ( response ) response->Release();
+         if ( params->clientId ) WindowsDeleteString( params->clientId );
+         if ( params ) delete params;
+-        return S_OK;
++        return status;
+     }
+ 
+     static HRESULT WINAPI
+@@ -241,7 +240,7 @@ _CLEANUP:
+         DWORD ret;
+         UINT16 messageType;
+         HRESULT status;
+-        HSTRING bufferClass;
++        HSTRING bufferClass = nullptr;
+ 
+         IXodusIPCPacket *xodusPacket = nullptr;
+         IXodusIPCPacket *xodusPacketResult = nullptr;
+@@ -267,18 +266,18 @@ _CLEANUP:
+             message
+         );
+ 
+-        xodus_ipclayer->SendRequestAsync( xodusPacket, &response );
++        status = xodus_ipclayer->SendRequestAsync( xodusPacket, &response );
++        if ( FAILED( status ) ) goto _CLEANUP;
+ 
+         status = response->GetResults( TRUE, &xodusPacketResult );
+         if ( FAILED( status ) ) goto _CLEANUP;
+ 
+-        xodusPacket->Release();
+         message->Release();
+         message = nullptr;
+ 
+         xodusPacketResult->get_MessageType( &messageType );
+         if ( messageType != 2 /* PONG */)
+-            return E_INVALIDARG;
++            status = E_INVALIDARG;
+ 
+ _CLEANUP:
+         if ( bufferClass ) WindowsDeleteString( bufferClass );

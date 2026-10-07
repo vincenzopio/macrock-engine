@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 14:19:12 +0200
+Subject: [PATCH] include: Add IStorageFileStatics and the streamed file types.
+
+IStorageFileStatics (5984c710-daf2-43c8-8bb4-a4d3eacfd03f) and what its methods need:
+StreamedFileFailureMode, IStreamedFileDataRequest, StreamedFileDataRequestedHandler and the
+StreamedFileDataRequest runtime class. StorageFile now names its statics interface.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: storage-file
+---
+ include/windows.storage.idl | 84 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 83 insertions(+), 1 deletion(-)
+
+diff --git a/include/windows.storage.idl b/include/windows.storage.idl
+index 6f4aa6d803b5123e0f625c077ff40b257c988dad..0ad21372f0f6f686cf5ca958c7823283dd5d7bdc 100644
+--- a/include/windows.storage.idl
++++ b/include/windows.storage.idl
+@@ -49,6 +49,7 @@ namespace Windows.Storage {
+     typedef enum NameCollisionOption NameCollisionOption;
+     typedef enum StorageDeleteOption StorageDeleteOption;
+     typedef enum StorageItemTypes StorageItemTypes;
++    typedef enum StreamedFileFailureMode StreamedFileFailureMode;
+ 
+     interface IApplicationData;
+     interface IApplicationData2;
+@@ -71,6 +72,7 @@ namespace Windows.Storage {
+     interface IStorageFolderStatics;
+     interface IStorageFolderStatics2;
+     interface IStorageItem;
++    interface IStreamedFileDataRequest;
+ 
+     runtimeclass ApplicationData;
+     runtimeclass ApplicationDataContainer;
+@@ -80,6 +82,7 @@ namespace Windows.Storage {
+     runtimeclass StorageFolder;
+     runtimeclass StorageFile;
+     runtimeclass StorageStreamTransaction;
++    runtimeclass StreamedFileDataRequest;
+ 
+     declare {
+         interface Windows.Foundation.Collections.IKeyValuePair<HSTRING, Windows.Storage.ApplicationDataContainer *>;
+@@ -242,6 +245,16 @@ namespace Windows.Storage {
+         File   = 0x1,
+         Folder = 0x2,
+     };
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    enum StreamedFileFailureMode
++    {
++        Failed               = 0,
++        CurrentlyUnavailable = 1,
++        Incomplete           = 2,
++    };
+ #endif
+ 
+     [
+@@ -250,6 +263,14 @@ namespace Windows.Storage {
+     ]
+     delegate HRESULT ApplicationDataSetVersionHandler([in] Windows.Storage.SetVersionRequest *version);
+ 
++#ifndef _WINDOWS_APPLICATIONDATA
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        uuid(fef6a824-2fe1-4d07-a35b-b77c50b5f4cc)
++    ]
++    delegate HRESULT StreamedFileDataRequestedHandler([in] Windows.Storage.StreamedFileDataRequest *stream);
++#endif
++
+     [
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+         exclusiveto(Windows.Storage.ApplicationData),
+@@ -526,6 +547,47 @@ namespace Windows.Storage {
+         HRESULT MoveAndReplaceAsync([in] Windows.Storage.IStorageFile *file, [out, retval] Windows.Foundation.IAsyncAction **operation);
+     }
+ 
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Storage.StorageFile),
++        uuid(5984c710-daf2-43c8-8bb4-a4d3eacfd03f)
++    ]
++    interface IStorageFileStatics : IInspectable
++    {
++        HRESULT GetFileFromPathAsync(
++            [in] HSTRING path,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++        HRESULT GetFileFromApplicationUriAsync(
++            [in] Windows.Foundation.Uri *uri,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++        HRESULT CreateStreamedFileAsync(
++            [in] HSTRING display_name_with_extension,
++            [in] Windows.Storage.StreamedFileDataRequestedHandler *data_requested,
++            [in] Windows.Storage.Streams.IRandomAccessStreamReference *thumbnail,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++        HRESULT ReplaceWithStreamedFileAsync(
++            [in] Windows.Storage.IStorageFile *file_to_replace,
++            [in] Windows.Storage.StreamedFileDataRequestedHandler *data_requested,
++            [in] Windows.Storage.Streams.IRandomAccessStreamReference *thumbnail,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++        HRESULT CreateStreamedFileFromUriAsync(
++            [in] HSTRING display_name_with_extension,
++            [in] Windows.Foundation.Uri *uri,
++            [in] Windows.Storage.Streams.IRandomAccessStreamReference *thumbnail,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++        HRESULT ReplaceWithStreamedFileFromUriAsync(
++            [in] Windows.Storage.IStorageFile *file_to_replace,
++            [in] Windows.Foundation.Uri *uri,
++            [in] Windows.Storage.Streams.IRandomAccessStreamReference *thumbnail,
++            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Storage.StorageFile *> **operation
++        );
++    }
++
+     [
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+         uuid(72d1cb78-b3ef-4f75-a80b-6fd9dae2944b)
+@@ -605,6 +667,16 @@ namespace Windows.Storage {
+         [propget] HRESULT Stream([out, retval] Windows.Storage.Streams.IRandomAccessStream **value);
+         HRESULT CommitAsync([out, retval] Windows.Foundation.IAsyncAction **operation);
+     }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0),
++        exclusiveto(Windows.Storage.StreamedFileDataRequest),
++        uuid(1673fcce-dabd-4d50-beee-180b8a8191b6)
++    ]
++    interface IStreamedFileDataRequest : IInspectable
++    {
++        HRESULT FailAndClose([in] Windows.Storage.StreamedFileFailureMode failure_mode);
++    }
+ #endif
+ 
+     [
+@@ -668,7 +740,7 @@ namespace Windows.Storage {
+ 
+     [
+         contract(Windows.Foundation.UniversalApiContract, 1.0),
+-        /* static(Windows.Storage.IStorageFileStatics, Windows.Foundation.UniversalApiContract, 1.0), */
++        static(Windows.Storage.IStorageFileStatics, Windows.Foundation.UniversalApiContract, 1.0)
+         /* static(Windows.Storage.IStorageFileStatics2, Windows.Foundation.UniversalApiContract, 10.0) */
+     ]
+     runtimeclass StorageFile
+@@ -711,5 +783,15 @@ namespace Windows.Storage {
+         [default] interface Windows.Storage.IStorageStreamTransaction;
+         interface Windows.Foundation.IClosable;
+     }
++
++    [
++        contract(Windows.Foundation.UniversalApiContract, 1.0)
++    ]
++    runtimeclass StreamedFileDataRequest
++    {
++        [default] interface Windows.Storage.Streams.IOutputStream;
++        interface Windows.Foundation.IClosable;
++        interface Windows.Storage.IStreamedFileDataRequest;
++    }
+ #endif
+ }

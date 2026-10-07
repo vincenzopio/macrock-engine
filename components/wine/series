@@ -1,0 +1,24 @@
+# Patch series of the wine component, applied in this order by `tools/engine import`.
+# Written by `tools/engine export` from the commit order. Topics marked "optional" are applied
+# only with --with <topic> or --all.
+dxmt/0001-winemac.drv-Export-the-window-data-layout-DXMT-0.80-.patch
+msync/0001-ntdll-server-Add-msync-Rosetta-code-regions-and-WINE.patch
+msync/0002-ntdll-server-Fix-msync.patch
+d3dmetal/0001-winemac.drv-win32u-Add-the-D3DMetal-bridge.patch
+d3dmetal/0002-winemac.drv-Share-one-exported-macdrv_functions-tabl.patch
+fps-log/0001-winemac.drv-Add-an-optional-frame-pacing-log.patch
+window-title/0001-winemac.drv-Append-MACROCK_WINDOW_TITLE_SUFFIX-to-wi.patch
+afunix/0001-server-Allow-for-deletion-of-socket-files.patch
+afunix/0002-ws2_32-Add-support-for-AF_UNIX-sockets.patch
+afunix/0003-server-Introduce-error-when-attempting-to-create-a-S.patch
+afunix/0004-server-Fix-getsockname-and-accept-on-AF_UNIX-sockets.patch
+afunix/0005-ws2_32-Add-note-in-bind-for-AF_UNIX-sockets.patch
+afunix/0006-server-harden-the-AF_UNIX-socket-path-handling.patch
+afunix/0007-ntdll-report-bound-AF_UNIX-sockets-as-reparse-points.patch
+afunix/0008-server-give-AF_UNIX-sockets-their-family-before-bind.patch
+afunix/0009-server-open-bound-AF_UNIX-sockets-as-reparse-points.patch
+com-context/0001-combase-Export-the-apartment-s-IRundown-when-its-con.patch
+storage-file/0001-include-Add-IStorageFileStatics-and-the-streamed-fil.patch
+storage-file/0002-windows.storage-Add-an-IAsyncOperation-IInspectable-.patch
+storage-file/0003-windows.storage-Implement-StorageFile.GetFileFromPat.patch
+bcp47mrm/0001-bcp47mrm-Add-the-DLL-with-IsWellFormedTag-and-GetDis.patch

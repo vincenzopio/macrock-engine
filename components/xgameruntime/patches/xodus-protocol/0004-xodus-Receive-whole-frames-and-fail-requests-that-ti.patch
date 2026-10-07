@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 00:50:42 +0200
+Subject: [PATCH] xodus: Receive whole frames, and fail requests that time out
+ after 30 seconds.
+
+The socket thread read into a 2048-byte buffer, while a frame carries up to 65535 bytes after its
+8-byte header (an MSA token response is about 3.3 KB). Once the buffer was full, recv() was asked
+for 0 bytes, returned 0, and the thread took it for a disconnection. Size the buffer for the
+largest frame.
+
+A request that got no reply returned HRESULT_FROM_NT(STATUS_TIMEOUT), a success code; return
+HRESULT_FROM_WIN32(ERROR_TIMEOUT). Wait 30 seconds instead of 5: requests the service answers
+with Microsoft's services, such as a game license, can take 10.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: xodus-protocol
+---
+ src/Xodus/IPCLayer.cpp | 2 +-
+ src/private.h          | 6 ++++--
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/Xodus/IPCLayer.cpp b/src/Xodus/IPCLayer.cpp
+index babdb4ec464952b2e0e86f73a8efb78f448a836c..7879a4efaa82a2ed5a82ea8c1a0ac43fb7e6d275 100644
+--- a/src/Xodus/IPCLayer.cpp
++++ b/src/Xodus/IPCLayer.cpp
+@@ -447,7 +447,7 @@ private:
+         if ( asyncres )
+         {
+             WARN("Timeout while waiting for %p to respond.\n", handler);
+-            return HRESULT_FROM_NT( STATUS_TIMEOUT );
++            return HRESULT_FROM_WIN32( ERROR_TIMEOUT );
+         }
+ 
+         *result = context.response;
+diff --git a/src/private.h b/src/private.h
+index 0207461cb1b883624d4756581ca5e3e5645adbeb..b71f3bf1fefce32f3c8a2bf851cfca46515af57d 100644
+--- a/src/private.h
++++ b/src/private.h
+@@ -69,8 +69,10 @@
+ #include "windows.system.profile.h"
+ 
+ #define XODUS_SOCKET_SUFFIX "xodus.sock"
+-#define POLL_BUFFER_SIZE 2048
+-#define IPC_REQUEST_TIMEOUT_MS 5000
++/* A whole frame: the 8-byte header and the largest message its 16-bit length allows. */
++#define POLL_BUFFER_SIZE (8 + 0xffff)
++/* Game license replies can take 10 s. */
++#define IPC_REQUEST_TIMEOUT_MS 30000
+ 
+ #define E_ILLEGAL_METHOD_CALL                              _HRESULT_TYPEDEF_(0x8000000E)
+ 

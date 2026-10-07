@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:21:07 +0200
+Subject: [PATCH] xgameruntime: Include <type_traits> where XAsync.cpp uses it.
+
+XAsync.cpp uses std::alignment_of and std::is_trivially_destructible but relies on another
+header for <type_traits>: libstdc++ provides it that way, LLVM's libc++ does not.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: clang-build
+---
+ src/System/Threading/XAsync.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/System/Threading/XAsync.cpp b/src/System/Threading/XAsync.cpp
+index 2d73842b2d87256c46113fc3c87db06fbf52bd30..49ae8bcd61ce611b0a142a0feaf0ca322526f547 100644
+--- a/src/System/Threading/XAsync.cpp
++++ b/src/System/Threading/XAsync.cpp
+@@ -23,6 +23,7 @@
+ 
+ #include <atomic>
+ #include <condition_variable>
++#include <type_traits>
+ 
+ // Signatures can be anything because these are not exposed to the client.
+ #define ASYNC_BLOCK_SIG         0x41535942 // ASYB

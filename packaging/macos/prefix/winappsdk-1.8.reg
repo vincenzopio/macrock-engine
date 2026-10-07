@@ -1,0 +1,40 @@
+Windows Registry Editor Version 5.00
+
+; Windows App SDK 1.8 classes that Minecraft Bedrock activates. The game ships the SDK
+; self-contained, but its bootstrapper fails under Wine, so the classes are registered here,
+; in the game's own DLLs: the game folder must be drive G:. Wine reads only DllPath.
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Microsoft.Windows.Storage.Pickers.FileOpenPicker]
+"DllPath"="G:\\Microsoft.WindowsAppRuntime.dll"
+"ActivationType"=dword:00000000
+"Threading"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Microsoft.Windows.Storage.Pickers.FileSavePicker]
+"DllPath"="G:\\Microsoft.WindowsAppRuntime.dll"
+"ActivationType"=dword:00000000
+"Threading"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Microsoft.Windows.Storage.Pickers.FolderPicker]
+"DllPath"="G:\\Microsoft.WindowsAppRuntime.dll"
+"ActivationType"=dword:00000000
+"Threading"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Microsoft.Windows.ApplicationModel.Resources.ResourceManager]
+"DllPath"="G:\\Microsoft.Windows.ApplicationModel.Resources.dll"
+"ActivationType"=dword:00000000
+"Threading"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Microsoft.Windows.ApplicationModel.Resources.ResourceLoader]
+"DllPath"="G:\\Microsoft.Windows.ApplicationModel.Resources.dll"
+"ActivationType"=dword:00000000
+"Threading"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Microsoft.Windows.ApplicationModel.Resources.ResourceCandidate]
+"DllPath"="G:\\Microsoft.Windows.ApplicationModel.Resources.dll"
+"ActivationType"=dword:00000000
+"Threading"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\WindowsRuntime\ActivatableClassId\Microsoft.Windows.ApplicationModel.Resources.KnownResourceQualifierName]
+"DllPath"="G:\\Microsoft.Windows.ApplicationModel.Resources.dll"
+"ActivationType"=dword:00000000
+"Threading"=dword:00000000

@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 15:48:40 +0200
+Subject: [PATCH] xodus: Wake the waiting request when the service's connection
+ closes.
+
+A request waited for its reply until the timeout, 30 seconds, even after the socket thread had
+lost the service. The thread now invokes the handlers with no packet before it exits, and the
+waiting request fails at once with ERROR_CONNECTION_ABORTED.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: xodus-protocol
+---
+ src/Xodus/IPCLayer.cpp | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/Xodus/IPCLayer.cpp b/src/Xodus/IPCLayer.cpp
+index 1b7d1368c42909ec5aac6e2f983789f30d3a4912..98537790732f19f8ac889cd0392582cca25c1bf9 100644
+--- a/src/Xodus/IPCLayer.cpp
++++ b/src/Xodus/IPCLayer.cpp
+@@ -220,6 +220,7 @@ private:
+     {
+         HANDLE event;
+         IXodusIPCPacket *response;
++        BOOL closed; /* the connection closed before the reply came */
+     };
+ 
+     typedef struct _POLL_SOCKET_ARGS
+@@ -469,6 +470,11 @@ private:
+             if ( context.response ) context.response->Release();
+             return HRESULT_FROM_NT( nts );
+         }
++        if ( context.closed )
++        {
++            WARN("The Xodus service closed the connection before replying to message type %u.\n", header.Message_Type);
++            return HRESULT_FROM_WIN32( ERROR_CONNECTION_ABORTED );
++        }
+         if ( !context.response )
+         {
+             WARN("Timeout while waiting for a reply to message type %u.\n", header.Message_Type);
+@@ -490,6 +496,13 @@ private:
+ 
+         TRACE("context %p, packet %p\n", context, packet);
+ 
++        if ( !packet ) /* the connection closed */
++        {
++            ctx->closed = TRUE;
++            SetEvent( ctx->event );
++            return S_OK;
++        }
++
+         status = packet->get_MessageType( &messageType );
+         if ( FAILED( status ) ) return status;
+ 
+@@ -623,6 +636,13 @@ private:
+             }
+         }
+ 
++        /* Wake the request waiting for a reply that will not come. */
++        {
++            const std::lock_guard<std::mutex> lock( iface->m_CallbacksLock );
++            LIST_FOR_EACH_ENTRY( currCallback, &iface->m_Callbacks, response_received_callback, entry )
++                currCallback->handler->Invoke( nullptr );
++        }
++
+         MessageBoxA( nullptr, "Socket Thread unexpectedly exited!", "Critical Error Occurred!", MB_ICONERROR );
+         bufferFactory->Release();
+         throw Exception( HRESULT_FROM_NT( status ), "Socket Thread unexpectedly exited!" );

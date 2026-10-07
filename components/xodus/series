@@ -1,0 +1,6 @@
+# Patch series of the xodus component, applied in this order by `tools/engine import`.
+# Written by `tools/engine export` from the commit order. Topics marked "optional" are applied
+# only with --with <topic> or --all.
+socket-path/0001-service-take-the-socket-path-from-XODUS_SOCKET.patch
+credential-namespace/0001-secrets-choose-the-keychain-service-with-XODUS_KEYCH.patch
+game-license/0001-service-answer-game-license-requests.patch

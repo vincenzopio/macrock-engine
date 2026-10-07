@@ -1,0 +1,21 @@
+# Bundled dylib (lib/<name>, matched by prefix; the first match wins) -> license directory, SPDX.
+# The dylibs are the Gcenx archive's MacPorts builds (pins.sh); the texts come from the same
+# projects (Homebrew kegs, or upstream for those Homebrew does not install).
+libbrotli               brotli                    MIT
+libbz2                  bzip2                     bzip2-1.0.6
+libffi                  libffi                    MIT
+libfreetype             freetype                  FTL OR GPL-2.0-or-later
+libgmp                  gmp                       LGPL-3.0-or-later OR GPL-2.0-or-later
+libgnutls               gnutls                    LGPL-2.1-or-later
+libhogweed              nettle                    LGPL-3.0-or-later OR GPL-2.0-or-later
+libnettle               nettle                    LGPL-3.0-or-later OR GPL-2.0-or-later
+libiconv                libiconv                  LGPL-2.1-or-later
+libidn2                 libidn2                   LGPL-3.0-or-later OR GPL-2.0-or-later
+libintl                 libintl                   LGPL-2.1-or-later
+libMacportsLegacySupport macports-legacy-support  MIT AND APSL-2.0
+libp11-kit              p11-kit                   BSD-3-Clause
+libpng16                libpng                    libpng-2.0
+libtasn1                libtasn1                  LGPL-2.1-or-later
+libunistring            libunistring              LGPL-3.0-or-later OR GPL-2.0-or-later
+libz.                   zlib                      Zlib
+libzstd                 zstd                      BSD-3-Clause OR GPL-2.0-only

@@ -1,0 +1,309 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 10:47:40 +0200
+Subject: [PATCH] service: answer game license requests.
+
+GAME_LICENSE_REQUEST (100) carries a title's Store product id and market. The service finds the
+title's package in the display catalog and asks the licensing service for a license to its
+content with the device's and the user's MSA tokens, as xodus-cli's license command does.
+GAME_LICENSE_RESPONSE (101) says whether the license is active, whether it is a trial, and the
+SKU the Store licenses; an account that does not own the title gets an inactive license, and a
+failure to find out an HRESULT. xgameruntime's XStoreQueryGameLicense uses it.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: game-license
+---
+ crates/xodus-service/src/connection/xml.rs    |  31 ++++
+ crates/xodus/proto/xodus/common.proto         |   3 +
+ crates/xodus/src/licensing.rs                 |   1 +
+ crates/xodus/src/licensing/game.rs            | 138 ++++++++++++++++++
+ crates/xodus/src/models/displaycatalog.rs     |   6 +
+ crates/xodus/src/models/xgameruntime/mod.rs   |   1 +
+ .../xodus/src/models/xgameruntime/xstore.rs   |  24 +++
+ 7 files changed, 204 insertions(+)
+ create mode 100644 crates/xodus/src/licensing/game.rs
+ create mode 100644 crates/xodus/src/models/xgameruntime/xstore.rs
+
+diff --git a/crates/xodus-service/src/connection/xml.rs b/crates/xodus-service/src/connection/xml.rs
+index 8ce765b05e5899a7e1b8f4ea19213cfc408ebcc0..ee112d5274939f991cc432f8bd180923801c0a7e 100644
+--- a/crates/xodus-service/src/connection/xml.rs
++++ b/crates/xodus-service/src/connection/xml.rs
+@@ -2,6 +2,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ use xodus::models::live::ExchangeUserTokenOutcome;
+ use xodus::models::secrets::Token;
+ use xodus::models::soap;
++use xodus::models::xgameruntime::xstore::{GameLicenseRequest, GameLicenseResponse};
+ use xodus::models::xgameruntime::xuser::{MSATokenRequest, MSATokenResponse};
+ use xodus::proto::xodus::XodusMessageType;
+ 
+@@ -127,6 +128,36 @@ pub async fn parse_message(
+                 _ => todo!("Error handling sill sucks"),
+             }
+         }
++        XodusMessageType::GameLicenseRequest => {
++            let req = quick_xml::de::from_str::<GameLicenseRequest>(std::str::from_utf8(&buffer)?)?;
++            let market = req.market.unwrap_or_else(|| "US".to_owned());
++            let payload = match xodus::licensing::game::query_game_license(
++                &context.client,
++                context.tokens(),
++                &req.store_id,
++                &market,
++            )
++            .await
++            {
++                Ok(license) => {
++                    tracing::info!(
++                        "Game license for {}: active {}, trial {}",
++                        req.store_id, license.is_active, license.is_trial
++                    );
++                    GameLicenseResponse {
++                        is_active: license.is_active,
++                        is_trial: license.is_trial,
++                        sku_store_id: license.sku_store_id,
++                        ..Default::default()
++                    }
++                }
++                Err(err) => {
++                    tracing::warn!("Game license for {} unknown: {err}", req.store_id);
++                    GameLicenseResponse { result: 0x80004005, ..Default::default() } // E_FAIL
++                }
++            };
++            Ok(quick_xml::se::to_string(&payload)?.into_bytes())
++        }
+         _ => Err("Unimplemented".into()),
+     }
+ }
+diff --git a/crates/xodus/proto/xodus/common.proto b/crates/xodus/proto/xodus/common.proto
+index c7741a68fa67f2bbac3ce6d958ecee2d1641228c..f1fd68a5fc65a797599bb121434e370316096c5a 100644
+--- a/crates/xodus/proto/xodus/common.proto
++++ b/crates/xodus/proto/xodus/common.proto
+@@ -8,4 +8,7 @@ enum XodusMessageType {
+     PONG = 2;
+     MSA_TOKEN_REQUEST=3;
+     MSA_TOKEN_RESPONSE=4;
++    // macrock's messages, numbered apart from upstream's.
++    GAME_LICENSE_REQUEST=100;
++    GAME_LICENSE_RESPONSE=101;
+ }
+diff --git a/crates/xodus/src/licensing.rs b/crates/xodus/src/licensing.rs
+index c0e11f5afedce3d3c01c588eee08f68e29a3175b..91c297aecf0ab0181d7687f3906135cd81110714 100644
+--- a/crates/xodus/src/licensing.rs
++++ b/crates/xodus/src/licensing.rs
+@@ -1,3 +1,4 @@
+ pub mod content;
++pub mod game;
+ pub mod splicense;
+ pub mod utils;
+diff --git a/crates/xodus/src/licensing/game.rs b/crates/xodus/src/licensing/game.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..aec01623b54650e2dd0f6b26e32cf03112e620b3
+--- /dev/null
++++ b/crates/xodus/src/licensing/game.rs
+@@ -0,0 +1,138 @@
++//! The game license of the signed-in account, as Gaming Services gets it for a title's
++//! XStoreQueryGameLicense: the title's package from the display catalog, then a license for its
++//! content from the licensing service, with the device's and the user's MSA tokens. A license
++//! the service cannot satisfy means that the account does not own the title.
++
++use crate::api::displaycatalog::find_products_by_id;
++use crate::api::live::{exchange_device_token, exchange_user_token};
++use crate::licensing::content::{LicenseContentError, get_license_content};
++use crate::models::live::ExchangeUserTokenOutcome;
++use crate::models::secrets::Token;
++use crate::models::soap;
++use crate::tokens::TokenManager;
++
++const LICENSING_APP_ID: &str = "{d6d5a677-0872-4ab0-9442-bb792fce85c5}";
++
++/// What a game license query found out.
++#[derive(Debug, Default)]
++pub struct GameLicense {
++    pub is_active: bool,
++    pub is_trial: bool,
++    pub sku_store_id: String,
++}
++
++#[derive(Debug, thiserror::Error)]
++pub enum GameLicenseError {
++    #[error("catalog: {0}")]
++    Catalog(String),
++    #[error("tokens: {0}")]
++    Tokens(String),
++    #[error("request error: {0}")]
++    Request(#[from] reqwest::Error),
++}
++
++pub async fn query_game_license(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++    store_id: &str,
++    market: &str,
++) -> Result<GameLicense, GameLicenseError> {
++    let neutral = vec!["neutral".to_owned()];
++    let catalog = find_products_by_id(client, store_id.to_owned(), market.to_owned(), neutral).await?;
++    let mut content_id = None;
++    // A license does not name the SKU it satisfies: take the first the Store licenses.
++    let (mut full_sku, mut trial_sku) = (None, None);
++    for availability in &catalog.product.display_sku_availabilities {
++        let sku = &availability.sku;
++        let licensable = availability
++            .availabilities
++            .iter()
++            .any(|a| a.actions.iter().any(|action| action == "License"));
++        let slot = if sku.properties.is_trial { &mut trial_sku } else { &mut full_sku };
++        if licensable && slot.is_none() {
++            *slot = Some(format!("{store_id}/{}", sku.sku_id));
++        }
++        if content_id.is_none() {
++            content_id = sku
++                .properties
++                .packages
++                .iter()
++                .find(|package| {
++                    package.platform_dependencies.iter().any(|dep| dep.platform_name == "Windows.Desktop")
++                })
++                .and_then(|package| package.content_id.clone());
++        }
++    }
++    let content_id = content_id.ok_or_else(|| {
++        GameLicenseError::Catalog(format!("no Windows.Desktop package for {store_id}"))
++    })?;
++
++    let (device_token, user_token, puid) = licensing_tokens(client, tokens).await?;
++    match get_license_content(client, device_token, user_token, puid, content_id, market.to_owned()).await {
++        Ok((_content, license)) => {
++            let is_trial = license.license_info.license_category.as_deref() == Some("Trial");
++            let sku_store_id = if is_trial { trial_sku } else { full_sku }.unwrap_or_default();
++            Ok(GameLicense { is_active: true, is_trial, sku_store_id })
++        }
++        Err(LicenseContentError::NotEntitled { description }) => {
++            tracing::info!("No license for {store_id}: {description}");
++            Ok(GameLicense::default())
++        }
++        Err(LicenseContentError::Request(error)) => Err(error.into()),
++    }
++}
++
++/// The device's and the user's MSA tokens for the licensing service, and the user's PUID.
++async fn licensing_tokens(
++    client: &reqwest::Client,
++    tokens: &TokenManager,
++) -> Result<(String, String, String), GameLicenseError> {
++    let failed = |what: &str| GameLicenseError::Tokens(what.to_owned());
++    let Ok(Token::Legacy(device_sts)) = tokens.get_device_sts_token() else {
++        return Err(failed("no device STS token"));
++    };
++    let user = tokens.get_user().map_err(|_| failed("no signed-in user"))?;
++    let Ok(Token::Legacy(user_sts)) = tokens.get_user_sts_token() else {
++        return Err(failed("no user STS token"));
++    };
++    let policy = || Some(soap::PolicyReference::mbi_ssl());
++
++    let device_token = exchange_device_token(
++        client,
++        device_sts.clone(),
++        LICENSING_APP_ID.to_owned(),
++        "www.microsoft.com".to_owned(),
++        policy(),
++    )
++    .await
++    .map_err(|_| failed("device token exchange"))?;
++    let Token::Compact(device_token) = Token::from(device_token) else {
++        return Err(failed("unexpected device token"));
++    };
++
++    let outcome = exchange_user_token(
++        client,
++        user_sts,
++        user.username,
++        device_sts,
++        None,
++        Some("Silent".to_owned()),
++        LICENSING_APP_ID.to_owned(),
++        &[("www.microsoft.com".to_owned(), policy())],
++    )
++    .await
++    .map_err(|_| failed("user token exchange"))?;
++    let user_token: Token = match outcome {
++        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection))
++            if !collection.security_tokens.is_empty() =>
++        {
++            collection.security_tokens.remove(0).into()
++        }
++        ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(token)) => (*token).into(),
++        _ => return Err(failed("user token exchange refused")),
++    };
++    let Token::Compact(user_token) = user_token else {
++        return Err(failed("unexpected user token"));
++    };
++    Ok((device_token, user_token, user.puid))
++}
+diff --git a/crates/xodus/src/models/displaycatalog.rs b/crates/xodus/src/models/displaycatalog.rs
+index 7161d8aec9e8200bdf7af5bd11bd239f5bfb8d67..a43d1a6ce819f024c1df9a724c041fdd90fc3f4f 100644
+--- a/crates/xodus/src/models/displaycatalog.rs
++++ b/crates/xodus/src/models/displaycatalog.rs
+@@ -22,6 +22,8 @@ pub struct DisplaySkuAvailability {
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ #[serde(rename_all = "PascalCase")]
+ pub struct Sku {
++    #[serde(default)]
++    pub sku_id: String,
+     pub properties: SkuProperties,
+ }
+ 
+@@ -29,6 +31,8 @@ pub struct Sku {
+ #[serde(rename_all = "PascalCase")]
+ pub struct SkuProperties {
+     pub packages: Vec<Package>,
++    #[serde(default)]
++    pub is_trial: bool,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -48,6 +52,8 @@ pub struct PlatformDependency {
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ #[serde(rename_all = "PascalCase")]
+ pub struct Availability {
++    #[serde(default)]
++    pub actions: Vec<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub licensing_data: Option<LicensingData>,
+ }
+diff --git a/crates/xodus/src/models/xgameruntime/mod.rs b/crates/xodus/src/models/xgameruntime/mod.rs
+index 01f38b752c41e7895137125741a1616f360c630a..010c9c955f21f31a2e6a8403aa98416f41a93fe2 100644
+--- a/crates/xodus/src/models/xgameruntime/mod.rs
++++ b/crates/xodus/src/models/xgameruntime/mod.rs
+@@ -1 +1,2 @@
++pub mod xstore;
+ pub mod xuser;
+diff --git a/crates/xodus/src/models/xgameruntime/xstore.rs b/crates/xodus/src/models/xgameruntime/xstore.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..835519315660a5ff5d63d186439f6e261ab7843e
+--- /dev/null
++++ b/crates/xodus/src/models/xgameruntime/xstore.rs
+@@ -0,0 +1,24 @@
++use serde::{Deserialize, Serialize};
++
++/// A title asking whether the signed-in account may play it (XStoreQueryGameLicense).
++#[derive(Deserialize, Debug)]
++#[serde(rename_all = "PascalCase")]
++pub struct GameLicenseRequest {
++    /// The title's Store product id (StoreId in its MicrosoftGame.config).
++    pub store_id: String,
++    /// The Store market, e.g. "US".
++    #[serde(default)]
++    pub market: Option<String>,
++}
++
++#[derive(Serialize, Debug, Default)]
++#[serde(rename_all = "PascalCase")]
++pub struct GameLicenseResponse {
++    /// 0, or the HRESULT of a failure to find out; an account without a license gets 0 and
++    /// IsActive false.
++    pub result: u32,
++    pub is_active: bool,
++    pub is_trial: bool,
++    /// "<product id>/<sku id>" when known.
++    pub sku_store_id: String,
++}

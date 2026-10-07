@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 21:06:54 +0200
+Subject: [PATCH] winemac.drv: Share one exported macdrv_functions table
+ between DXMT and D3DMetal.
+
+The DXMT adapter (topic dxmt) and the D3DMetal bridge both export "macdrv_functions", which
+DXMT and D3DMetal look up by name; they share the first ten slots but expect different window
+data. d3dmetal.c keeps the D3DMetal table exported, and a constructor installs DXMT's
+callbacks into it unless CX_ACTIVE_GRAPHICS_BACKEND=d3dmetal.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: d3dmetal
+---
+ dlls/winemac.drv/d3dmetal.c | 11 +++++++++++
+ dlls/winemac.drv/macdrv.h   |  1 +
+ dlls/winemac.drv/window.c   | 10 ++++++++--
+ 3 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/winemac.drv/d3dmetal.c b/dlls/winemac.drv/d3dmetal.c
+index c103b1a5f36598e5b807e260fe7f1f3b98ce3086..5f77bd08e2f0f4a6338a640a2d30143d0f4e9a7d 100644
+--- a/dlls/winemac.drv/d3dmetal.c
++++ b/dlls/winemac.drv/d3dmetal.c
+@@ -426,6 +426,17 @@ DECLSPEC_EXPORT struct macdrv_functions_t macdrv_functions =
+     &my_SetWindowLongPtrW,
+ };
+ 
++/* One process uses one graphics backend: keep D3DMetal's callbacks when it is active
++ * (CX_ACTIVE_GRAPHICS_BACKEND=d3dmetal), otherwise serve DXMT's adapter from window.c.
++ * Runs when winemac.so is loaded, before either backend looks the table up. */
++static void __attribute__((constructor)) select_macdrv_functions(void)
++{
++    const char *backend = getenv("CX_ACTIVE_GRAPHICS_BACKEND");
++
++    if (!backend || strcmp(backend, "d3dmetal"))
++        macdrv_install_dxmt_functions(&macdrv_functions, sizeof(macdrv_functions));
++}
++
+ void macdrv_client_surface_presented(const macdrv_event *event)
+ {
+     TRACE("client_surface %p\n", event->client_surface_presented.client_surface);
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index cb689b662845adff4d168c0b8dfe60b19676b667..1a087d3b431ffaa500b0c121b43725c648b35f4b 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -207,6 +207,7 @@ extern BOOL macdrv_SystemParametersInfo(UINT action, UINT int_param, void *ptr_p
+ 
+ extern struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client);
+ extern BOOL macdrv_client_surface_acquire_metal_swapchain(struct macdrv_client_surface *surface);
++extern void macdrv_install_dxmt_functions(void *table, size_t size);
+ 
+ extern struct macdrv_win_data *get_win_data(HWND hwnd);
+ extern void release_win_data(struct macdrv_win_data *data);
+diff --git a/dlls/winemac.drv/window.c b/dlls/winemac.drv/window.c
+index 689fd06f5bdd92ba6591e261da14d849d4e7c2ca..8eb300942e49531d4dbd39120646494f894cef21 100644
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -324,7 +324,7 @@ static void dxmt_release_metal_view(macdrv_metal_view view)
+ }
+ 
+ /* Only the callbacks consumed by DXMT 0.80 are part of this adapter contract. */
+-const struct
++static const struct
+ {
+     void (*init_display_devices)(BOOL);
+     struct dxmt_win_data *(*get_win_data)(HWND);
+@@ -336,7 +336,7 @@ const struct
+     macdrv_metal_layer (*view_get_metal_layer)(macdrv_metal_view);
+     void (*view_release_metal_view)(macdrv_metal_view);
+     void *on_main_thread;
+-} macdrv_functions __attribute__((visibility("default"))) =
++} dxmt_functions =
+ {
+     NULL,
+     dxmt_get_win_data,
+@@ -350,6 +350,12 @@ const struct
+     NULL
+ };
+ 
++void macdrv_install_dxmt_functions(void *table, size_t size)
++{
++    if (sizeof(dxmt_functions) > size) return;
++    memcpy(table, &dxmt_functions, sizeof(dxmt_functions));
++}
++
+ /***********************************************************************
+  *              macdrv_get_cocoa_window
+  *

@@ -1,0 +1,2629 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 00:56:32 +0200
+Subject: [PATCH] xgameruntime: Implement XUser through the Xodus service.
+
+Sign-in: XUserAddAsync() gets the user's and the device's RPS tickets for the title's MSA app
+from the Xodus service and signs in as Win32 titles do, through SISU: a device token from
+device.auth.xboxlive.com, then the user, title and XSTS tokens from sisu.xboxlive.com/authorize,
+all bound to an ECDSA P-256 proof key with which the requests are signed. The user's xuid,
+gamertags, age group and privileges come from the XSTS claims. One user is signed in at a time;
+adding again returns it, and with no account in the service XUserAddAsync() fails with
+E_GAMEUSER_NO_DEFAULT_USER.
+
+Tokens: XUserGetTokenAndSignature() follows the NSAL, the title's endpoint list then the default
+one, the most specific entry winning; WebSocket URLs are looked up as their HTTP counterparts. A
+URL with no relying party gets E_GAMEUSER_NO_TOKEN_REQUIRED, which XSAPI takes as "send no
+Authorization header". XSTS tokens are cached per relying party until five minutes before they
+expire and renewed once from new tickets on a 401; a relying party that refuses one, or a failed
+renewal of the user's tokens, is not tried again for a minute. Requests are signed when their
+endpoint has a signature policy, as the GDK documentation's "Proof keys" section describes
+(version 1, ES256); results follow Xal's documentation (sizes count the NUL, an unsigned request
+has a null signature).
+
+Requests go through WinHTTP, which validates certificates, with a failed GET tried once more;
+JSON goes through Windows.Data.Json. Failures log the host, the HTTP status and XErr, never a
+token. Gamer pictures, ResolveIssue, adding a user by id, sign-out and MSA tokens for the title
+are stubs.
+
+NsalTests check URL parsing, endpoint matching and the signed bytes offline. XUserNoAccountTests
+need a service with no account (XGR_XODUS_NO_ACCOUNT=1), and XUserLiveTests sign in for real
+(XGR_LIVE_XBOX=1, a signed-in service and the title's MicrosoftGame.config).
+
+Written anew after WineGDK's XUser.c (LGPL-2.1-or-later), Microsoft's documentation and the Xal
+headers; original work for macrock.
+
+Topic: xuser
+---
+ src/CMakeLists.txt          |   4 +
+ src/System/Nsal.cpp         | 198 ++++++++
+ src/System/Nsal.h           | 103 ++++
+ src/System/XUser.cpp        | 945 ++++++++++++++++++++++++++++++++++++
+ src/System/XboxLive.cpp     | 561 +++++++++++++++++++++
+ src/System/XboxLive.h       | 117 +++++
+ src/main.cpp                |   2 +
+ src/private.h               |   1 +
+ tests/CMakeLists.txt        |   4 +
+ tests/System/test_nsal.cpp  | 187 +++++++
+ tests/System/test_xuser.cpp | 347 +++++++++++++
+ 11 files changed, 2469 insertions(+)
+ create mode 100644 src/System/Nsal.cpp
+ create mode 100644 src/System/Nsal.h
+ create mode 100644 src/System/XUser.cpp
+ create mode 100644 src/System/XboxLive.cpp
+ create mode 100644 src/System/XboxLive.h
+ create mode 100644 tests/System/test_nsal.cpp
+ create mode 100644 tests/System/test_xuser.cpp
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index f10a9163abeb73fe8397d9b5305a10dbc9b5875d..6d088449b70e4d2f7f818b78f438fe1135f5a070 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -25,6 +25,9 @@ target_sources(xgameruntime PRIVATE
+         System/XGameRuntimeFeature.cpp
+         System/XNetworking.cpp
+         System/XSystem.cpp
++        System/XUser.cpp
++        System/Nsal.cpp
++        System/XboxLive.cpp
+         System/XThreading.cpp )
+ 
+ # System/Threading (based on libHttpClient)
+@@ -47,6 +50,7 @@ target_link_libraries(xgameruntime PRIVATE
+         runtimeobject
+         bcrypt
+         crypt32
++        winhttp
+         ws2_32
+         LibXml2 )
+ 
+diff --git a/src/System/Nsal.cpp b/src/System/Nsal.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ca5ee07e61368ce039816b444d761641e7faec4
+--- /dev/null
++++ b/src/System/Nsal.cpp
+@@ -0,0 +1,198 @@
++/*
++ * Xbox Game runtime Library
++ *  Network security authorization list (NSAL) and request signing
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "Nsal.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cstring>
++
++namespace XboxLive
++{
++
++static char LowerAscii( char c ) { return c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c; }
++
++std::string Lower( std::string text )
++{
++    for ( char &c : text ) c = LowerAscii( c );
++    return text;
++}
++
++static BOOL EqualNoCase( const std::string &a, const std::string &b )
++{
++    return a.size() == b.size() && std::equal( a.begin(), a.end(), b.begin(),
++                                               []( char x, char y ) { return LowerAscii( x ) == LowerAscii( y ); } );
++}
++
++BOOL ParseUrl( const char *url, Url *out )
++{
++    const char *schemeEnd, *authority, *end, *host, *portSeparator, *p;
++
++    if ( !url || !( schemeEnd = strstr( url, "://" ) ) || schemeEnd == url ) return FALSE;
++    for ( p = url; p < schemeEnd; ++p )
++        if ( !isalnum( (unsigned char)*p ) && *p != '+' && *p != '-' && *p != '.' ) return FALSE;
++
++    authority = schemeEnd + 3;
++    end = authority + strcspn( authority, "/?#" );
++    host = authority;
++    for ( p = authority; p < end; ++p )
++        if ( *p == '@' ) host = p + 1; /* user information */
++
++    portSeparator = end;
++    if ( *host == '[' ) /* an IPv6 address */
++    {
++        const char *close = static_cast<const char *>(memchr( host, ']', end - host ));
++        if ( close && close + 1 < end && close[1] == ':' ) portSeparator = close + 1;
++    }
++    else if ( ( p = static_cast<const char *>(memchr( host, ':', end - host )) ) ) portSeparator = p;
++    if ( portSeparator == host ) return FALSE;
++
++    out->scheme = Lower( std::string( url, schemeEnd ) );
++    out->host = Lower( std::string( host, portSeparator ) );
++    out->pathAndQuery = *end == '/' ? std::string( end ) : "/" + std::string( end );
++    return TRUE;
++}
++
++static BOOL HostMatches( const NsalEndpoint &endpoint, const std::string &host )
++{
++    if ( !endpoint.wildcard ) return host == endpoint.host;
++    return host.size() > endpoint.host.size() &&
++           !host.compare( host.size() - endpoint.host.size(), endpoint.host.size(), endpoint.host );
++}
++
++/* A path prefix matches whole segments: "/upsell" matches "/upsell/x" and "/upsell?x", not "/upsells". */
++static BOOL PathMatches( const std::string &prefix, const std::string &pathAndQuery )
++{
++    if ( prefix.empty() ) return TRUE;
++    if ( pathAndQuery.size() < prefix.size() || !EqualNoCase( pathAndQuery.substr( 0, prefix.size() ), prefix ) )
++        return FALSE;
++    if ( prefix.back() == '/' || pathAndQuery.size() == prefix.size() ) return TRUE;
++    return strchr( "/?#", pathAndQuery[prefix.size()] ) != nullptr;
++}
++
++const NsalEndpoint *Nsal::Find( const Url &url ) const
++{
++    const NsalEndpoint *best = nullptr;
++    SIZE_T bestScore[3] = { 0, 0, 0 };
++    /* The list names HTTP protocols only; WebSockets (XSAPI's real-time activity) open as such. */
++    const std::string protocol = url.scheme == "wss" ? "https" : url.scheme == "ws" ? "http" : url.scheme;
++
++    for ( const NsalEndpoint &endpoint : endpoints )
++    {
++        if ( endpoint.protocol != protocol || !HostMatches( endpoint, url.host ) ||
++             !PathMatches( endpoint.path, url.pathAndQuery ) )
++            continue;
++
++        SIZE_T score[3] = { endpoint.wildcard ? 1u : 2u, endpoint.host.size(), endpoint.path.size() };
++        if ( std::lexicographical_compare( bestScore, bestScore + 3, score, score + 3 ) )
++        {
++            best = &endpoint;
++            std::copy( score, score + 3, bestScore );
++        }
++    }
++    return best;
++}
++
++void Nsal::Append( const Nsal &other )
++{
++    INT32 offset = static_cast<INT32>(policies.size());
++
++    policies.insert( policies.end(), other.policies.begin(), other.policies.end() );
++    for ( NsalEndpoint endpoint : other.endpoints )
++    {
++        if ( endpoint.signaturePolicy >= 0 ) endpoint.signaturePolicy += offset;
++        endpoints.push_back( std::move( endpoint ) );
++    }
++}
++
++static void PutBigEndian( std::string *out, UINT64 value, int bytes )
++{
++    for ( int i = bytes - 1; i >= 0; --i ) *out += static_cast<char>( ( value >> ( 8 * i ) ) & 0xff );
++}
++
++std::string SigningPayload( const SignaturePolicy &policy, UINT64 timestamp, const char *method,
++                            const std::string &pathAndQuery, const std::string &authorization,
++                            const HttpHeaders &headers, const BYTE *body, SIZE_T bodySize )
++{
++    std::string payload;
++
++    PutBigEndian( &payload, policy.version, 4 );
++    payload += '\0';
++    PutBigEndian( &payload, timestamp, 8 );
++    payload += '\0';
++    for ( const char *c = method; *c; ++c ) payload += static_cast<char>( toupper( (unsigned char)*c ) );
++    payload += '\0';
++    payload += pathAndQuery;
++    payload += '\0';
++    payload += authorization;
++    payload += '\0';
++    /* A header the request lacks is signed as an empty value. */
++    for ( const std::string &name : policy.extraHeaders )
++    {
++        auto header = std::find_if( headers.begin(), headers.end(),
++                                    [&name]( const auto &h ) { return EqualNoCase( h.first, name ); } );
++        if ( header != headers.end() ) payload += header->second;
++        payload += '\0';
++    }
++    payload.append( reinterpret_cast<const char *>(body),
++                    static_cast<SIZE_T>( std::min<UINT64>( bodySize, policy.maxBodyBytes ) ) );
++    payload += '\0';
++    return payload;
++}
++
++std::string SignatureHeader( UINT32 version, UINT64 timestamp, const BYTE signature[64] )
++{
++    std::string raw;
++
++    PutBigEndian( &raw, version, 4 );
++    PutBigEndian( &raw, timestamp, 8 );
++    raw.append( reinterpret_cast<const char *>(signature), 64 );
++    return Base64( reinterpret_cast<const BYTE *>(raw.data()), raw.size() );
++}
++
++std::string Base64( const BYTE *data, SIZE_T size, BOOL url )
++{
++    const char *alphabet = url ? "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
++                               : "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++    std::string out;
++    SIZE_T i;
++
++    for ( i = 0; i + 2 < size; i += 3 )
++    {
++        UINT32 v = data[i] << 16 | data[i + 1] << 8 | data[i + 2];
++        out += alphabet[v >> 18]; out += alphabet[(v >> 12) & 63]; out += alphabet[(v >> 6) & 63]; out += alphabet[v & 63];
++    }
++    if ( size - i == 1 )
++    {
++        UINT32 v = data[i] << 16;
++        out += alphabet[v >> 18]; out += alphabet[(v >> 12) & 63];
++        if ( !url ) out += "==";
++    }
++    else if ( size - i == 2 )
++    {
++        UINT32 v = data[i] << 16 | data[i + 1] << 8;
++        out += alphabet[v >> 18]; out += alphabet[(v >> 12) & 63]; out += alphabet[(v >> 6) & 63];
++        if ( !url ) out += '=';
++    }
++    return out;
++}
++
++}
+diff --git a/src/System/Nsal.h b/src/System/Nsal.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..15f7d7e7dd82359a6c877d6c582fe6627ac078ee
+--- /dev/null
++++ b/src/System/Nsal.h
+@@ -0,0 +1,103 @@
++/*
++ * Xbox Game runtime Library
++ *  Network security authorization list (NSAL) and request signing
++ *
++ * The NSAL tells which relying party a request needs an Xbox Live token for, if any, and how
++ * the request is signed. Signatures follow "Title service calls to Xbox services" (Microsoft
++ * Game Development Kit documentation, "Proof keys"). Plain C++ with no runtime dependencies, so
++ * that the tests build it too.
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __XGAMERUNTIME_NSAL_H__
++#define __XGAMERUNTIME_NSAL_H__
++
++#include <windows.h>
++
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace XboxLive
++{
++
++/* What token requests depend on in a URL. */
++struct Url
++{
++    std::string scheme;       /* lowercase */
++    std::string host;         /* lowercase, without user information and port */
++    std::string pathAndQuery; /* everything from the path on; "/" when the URL has no path */
++};
++
++/* FALSE when the URL has no scheme or no host. */
++BOOL ParseUrl( const char *url, Url *out );
++
++struct SignaturePolicy
++{
++    UINT32 version = 0;
++    UINT64 maxBodyBytes = 0;
++    BOOL es256 = FALSE;                    /* among its SupportedAlgorithms */
++    std::vector<std::string> extraHeaders; /* signed in this order */
++};
++
++struct NsalEndpoint
++{
++    std::string protocol;       /* lowercase */
++    std::string host;           /* lowercase; for a wildcard, the part after "*" (".xboxlive.com") */
++    BOOL wildcard = FALSE;
++    std::string path;           /* empty: any path */
++    std::string relyingParty;   /* empty: requests to it carry no token */
++    std::string tokenType;
++    INT32 signaturePolicy = -1; /* index in Nsal::policies; -1: requests to it are not signed */
++};
++
++struct Nsal
++{
++    std::vector<NsalEndpoint> endpoints;
++    std::vector<SignaturePolicy> policies;
++
++    /* The endpoint that most specifically matches a URL: a host before a wildcard, a longer
++     * wildcard before a shorter one, then the longest path. The first one wins a tie. WebSocket
++     * URLs match the entries of their HTTP protocol (wss of https, ws of http). */
++    const NsalEndpoint *Find( const Url &url ) const;
++
++    /* Append the endpoints of another list, which come after these in a tie. */
++    void Append( const Nsal &other );
++};
++
++typedef std::vector<std::pair<std::string, std::string>> HttpHeaders;
++
++/* The bytes a version 1 signature covers: version, timestamp (a FILETIME), method, path and
++ * query, Authorization header, the policy's extra headers and up to maxBodyBytes of the body,
++ * each followed by a NUL. */
++std::string SigningPayload( const SignaturePolicy &policy, UINT64 timestamp, const char *method,
++                            const std::string &pathAndQuery, const std::string &authorization,
++                            const HttpHeaders &headers, const BYTE *body, SIZE_T bodySize );
++
++/* The Signature header: base64 of the version, the timestamp and the 64-byte signature. */
++std::string SignatureHeader( UINT32 version, UINT64 timestamp, const BYTE signature[64] );
++
++/* Base64; with url, the URL-safe alphabet without padding. */
++std::string Base64( const BYTE *data, SIZE_T size, BOOL url = FALSE );
++
++/* ASCII lowercase. */
++std::string Lower( std::string text );
++
++}
++
++#endif
+diff --git a/src/System/XUser.cpp b/src/System/XUser.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c2ebccd31dba793e25e2c98e99a17322c07ee3ee
+--- /dev/null
++++ b/src/System/XUser.cpp
+@@ -0,0 +1,945 @@
++/*
++ * Xbox Game runtime Library
++ *  GDK Component: System API -> XUser (sign-in, identity, tokens)
++ *
++ * Sign-in takes the Xodus service's MSA tickets to Xbox Live as Win32 titles do (SISU: device,
++ * title, user and XSTS tokens bound to a proof key); the identity comes from the XSTS claims, and
++ * tokens for other services follow the NSAL.
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "../private.h"
++#include "../Xodus/Structs.hpp"
++#include "GameConfig.h"
++#include "XboxLive.h"
++
++#include <private/IXAsync.hpp>
++#include <winstring.h>
++
++#include <algorithm>
++#include <atomic>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <set>
++#include <string>
++#include <vector>
++
++using namespace ABI;
++using namespace ABI::Xodus;
++
++/* The user an XUserHandle points to. The handle is a counted reference to it. */
++struct XUser
++{
++    std::atomic_long ref{ 1 };
++    UINT64 localId = 0;
++    UINT64 xuid = 0;
++    std::string gamertag, modernGamertag, modernSuffix, uniqueModern;
++    XUserAgeGroup ageGroup = XUserAgeGroup::Unknown;
++    std::set<UINT32> privileges;
++
++    /* The key all of the user's XSTS tokens are bound to; set at sign-in, then only read. */
++    XboxLive::ProofKey proofKey;
++
++    /* Behind tokensLock: the user, device and title tokens and when the first of them expires,
++     * when a failed renewal may be tried again, XSTS tokens by relying party, and relying parties
++     * that recently refused one. */
++    std::mutex tokensLock;
++    std::string userToken, deviceToken, titleToken;
++    UINT64 userTokenNotAfter = 0, refreshRetryAfter = 0;
++    std::map<std::string, XboxLive::XstsToken> xsts;
++    std::map<std::string, UINT64> xstsRetryAfter;
++};
++
++static const UINT64 second = 10000000, minute = 60 * second; /* in FILETIME units */
++static const char xboxLiveRelyingParty[] = "http://xboxlive.com";
++
++static void AddRef( XUser *user ) { ++user->ref; }
++static void Release( XUser *user ) { if ( !--user->ref ) delete user; }
++
++/* PC titles have one user: whoever signed in through Xodus. */
++static std::mutex usersLock;
++static XUser *signedInUser;
++
++static XUserAgeGroup ParseAgeGroup( const std::string &claim )
++{
++    if ( claim == "Adult" ) return XUserAgeGroup::Adult;
++    if ( claim == "Teen" ) return XUserAgeGroup::Teen;
++    if ( claim == "Child" ) return XUserAgeGroup::Child;
++    return XUserAgeGroup::Unknown;
++}
++
++static std::set<UINT32> ParsePrivileges( const std::string &claim )
++{
++    std::set<UINT32> privileges;
++    const char *p = claim.c_str();
++    char *end;
++
++    for ( ;; )
++    {
++        unsigned long value = strtoul( p, &end, 10 );
++        if ( end == p ) break;
++        privileges.insert( (UINT32)value );
++        p = end;
++    }
++    return privileges;
++}
++
++/* RPS tickets for the title and for the device from the Xodus service (the Microsoft account it
++ * signed in). The device ticket may be empty. */
++static HRESULT RequestRpsTicket( BOOLEAN allowUI, std::string *ticket, std::string *deviceTicket )
++{
++    const GameConfig &config = GetGameConfig();
++    IXAsync<IMsaTokenResponse *> *operation = nullptr;
++    IMsaTokenResponse *response = nullptr;
++    HSTRING clientId = nullptr, token = nullptr, device = nullptr;
++    HRESULT hr;
++
++    if ( FAILED( config.status ) ) return config.status;
++    if ( !config.msaAppId[0] ) return E_GAMEUSER_NO_MSAAPPID;
++
++    std::wstring wideId = XboxLive::Widen( config.msaAppId );
++    if ( FAILED( hr = WindowsCreateString( wideId.c_str(), (UINT32)wideId.size(), &clientId ) ) ) return hr;
++    if ( SUCCEEDED( hr = xodus_service->MsaTokenRequest( clientId, allowUI, config.msaFullTrust, &operation ) ) &&
++         SUCCEEDED( hr = operation->GetResults( TRUE, &response ) ) &&
++         SUCCEEDED( hr = response->get_Token( &token ) ) &&
++         SUCCEEDED( hr = response->get_DeviceRps( &device ) ) )
++    {
++        *ticket = XboxLive::Narrow( token );
++        *deviceTicket = XboxLive::Narrow( device );
++        if ( ticket->empty() ) hr = E_GAMEUSER_NO_DEFAULT_USER; /* the service has no signed-in account */
++    }
++    WindowsDeleteString( device );
++    WindowsDeleteString( token );
++    WindowsDeleteString( clientId );
++    if ( response ) response->Release();
++    if ( operation ) operation->Release();
++    return hr;
++}
++
++static UINT64 Earliest( UINT64 a, UINT64 b ) { return !a ? b : !b ? a : std::min( a, b ); }
++
++/* Xbox Live tokens for the account the Xodus service signed in, bound to the user's proof key,
++ * through SISU as the GDK gets them: the device, title and user tokens, and the XSTS token for
++ * http://xboxlive.com. Called at sign-in, then with tokensLock held. */
++static HRESULT Authenticate( XUser *user, BOOLEAN allowUI, XboxLive::XstsToken *identity )
++{
++    std::string ticket, deviceTicket, deviceToken;
++    XboxLive::SisuTokens sisu;
++    UINT64 deviceNotAfter = 0;
++    HRESULT hr;
++
++    if ( FAILED( hr = RequestRpsTicket( allowUI, &ticket, &deviceTicket ) ) )
++    {
++        WARN( "no RPS ticket from the Xodus service, hr %#lx.\n", hr );
++        return hr;
++    }
++    if ( deviceTicket.empty() )
++    {
++        WARN( "no device ticket from the Xodus service.\n" );
++        return E_GAMEUSER_FAILED_TO_GET_TOKEN;
++    }
++    if ( FAILED( hr = XboxLive::RequestDeviceToken( deviceTicket, user->proofKey, &deviceToken, &deviceNotAfter ) ) ||
++         FAILED( hr = XboxLive::SisuAuthorize( ticket, GetGameConfig().msaAppId, deviceToken, user->proofKey,
++                                               &sisu ) ) )
++    {
++        WARN( "SISU sign-in failed, hr %#lx.\n", hr );
++        return hr;
++    }
++    user->userToken = sisu.userToken;
++    user->deviceToken = deviceToken;
++    user->titleToken = sisu.titleToken;
++    user->userTokenNotAfter = Earliest( Earliest( sisu.userNotAfter, sisu.titleNotAfter ), deviceNotAfter );
++    *identity = sisu.xsts;
++    return S_OK;
++}
++
++static HRESULT SignIn( BOOLEAN allowUI, XUser **out )
++{
++    static std::atomic<UINT64> nextLocalId{ 1 };
++    XboxLive::XstsToken identity;
++    HRESULT hr;
++
++    XUser *user = new XUser();
++    if ( FAILED( hr = user->proofKey.Generate() ) )
++        WARN( "proof key generation failed, hr %#lx.\n", hr );
++    else
++        hr = Authenticate( user, allowUI, &identity );
++    if ( FAILED( hr ) )
++    {
++        Release( user );
++        return hr;
++    }
++
++    user->localId = nextLocalId++;
++    user->xuid = identity.xuid;
++    user->gamertag = identity.gamertag;
++    user->modernGamertag = identity.modernGamertag;
++    user->modernSuffix = identity.modernSuffix;
++    user->uniqueModern = identity.uniqueModern;
++    user->ageGroup = ParseAgeGroup( identity.ageGroup );
++    user->privileges = ParsePrivileges( identity.privileges );
++    user->xsts[xboxLiveRelyingParty] = identity;
++    TRACE( "signed in: local id %llu, %zu privileges, age group %d.\n", (unsigned long long)user->localId,
++           user->privileges.size(), (int)user->ageGroup );
++    *out = user;
++    return S_OK;
++}
++
++static const char addIdentity[] = "XUserAddAsync";
++
++struct AddContext
++{
++    XUserAddOptions options;
++    XUser *user = nullptr;
++};
++
++static HRESULT CALLBACK AddProvider( XAsyncOp op, const XAsyncProviderData *data )
++{
++    auto *context = static_cast<AddContext *>(data->context);
++
++    switch ( op )
++    {
++        case XAsyncOp::Begin:
++            return XAsyncSchedule( data->async, 0 );
++
++        case XAsyncOp::DoWork:
++        {
++            /* One sign-in at a time; later additions get the signed-in user. */
++            const std::lock_guard<std::mutex> lock( usersLock );
++            HRESULT hr = S_OK;
++
++            if ( !signedInUser )
++            {
++                BOOLEAN allowUI = !( static_cast<UINT32>(context->options) &
++                                     static_cast<UINT32>(XUserAddOptions::AddDefaultUserSilently) );
++                hr = SignIn( allowUI, &signedInUser );
++            }
++            if ( SUCCEEDED( hr ) )
++            {
++                AddRef( signedInUser );
++                context->user = signedInUser;
++            }
++            XAsyncComplete( data->async, hr, SUCCEEDED( hr ) ? sizeof(XUserHandle) : 0 );
++            return S_OK;
++        }
++
++        case XAsyncOp::GetResult:
++            *static_cast<XUserHandle *>(data->buffer) = context->user;
++            context->user = nullptr; /* the caller owns it now */
++            return S_OK;
++
++        case XAsyncOp::Cleanup:
++            if ( context->user ) Release( context->user );
++            delete context;
++            return S_OK;
++
++        default:
++            return S_OK;
++    }
++}
++
++/* New user, device and title tokens from new RPS tickets. Called with tokensLock held. */
++static HRESULT RefreshUserToken( XUser *user )
++{
++    XboxLive::XstsToken identity;
++    HRESULT hr;
++
++    if ( FAILED( hr = Authenticate( user, FALSE, &identity ) ) ) return hr;
++    user->xsts[xboxLiveRelyingParty] = identity;
++    return S_OK;
++}
++
++/* An XSTS token for a relying party: from the cache while it has five more minutes, else a new
++ * one. A relying party that refused one, or a failed renewal of the user's tokens, is not tried
++ * again for a minute. */
++static HRESULT GetXsts( XUser *user, const std::string &relyingParty, BOOL forceRefresh, XboxLive::XstsToken *out )
++{
++    const std::lock_guard<std::mutex> lock( user->tokensLock );
++    UINT64 now = XboxLive::Now();
++    DWORD status = 0;
++    HRESULT hr;
++
++    auto cached = user->xsts.find( relyingParty );
++    if ( !forceRefresh && cached != user->xsts.end() && cached->second.notAfter > now + 5 * minute )
++    {
++        *out = cached->second;
++        return S_OK;
++    }
++    auto refused = user->xstsRetryAfter.find( relyingParty );
++    if ( !forceRefresh && refused != user->xstsRetryAfter.end() && refused->second > now )
++        return E_GAMEUSER_FAILED_TO_GET_TOKEN;
++
++    if ( user->userTokenNotAfter <= now + 5 * minute )
++    {
++        if ( user->refreshRetryAfter > now ) return E_GAMEUSER_FAILED_TO_GET_TOKEN;
++        if ( FAILED( hr = RefreshUserToken( user ) ) )
++        {
++            user->refreshRetryAfter = now + minute;
++            return hr;
++        }
++    }
++    hr = XboxLive::RequestXstsToken( user->userToken, user->proofKey, relyingParty.c_str(), out, &status,
++                                     user->deviceToken, user->titleToken );
++    /* 401: a token expired or was revoked early. */
++    if ( FAILED( hr ) && status == 401 && SUCCEEDED( RefreshUserToken( user ) ) )
++        hr = XboxLive::RequestXstsToken( user->userToken, user->proofKey, relyingParty.c_str(), out, &status,
++                                         user->deviceToken, user->titleToken );
++    if ( FAILED( hr ) )
++    {
++        WARN( "no XSTS token for relying party %s, hr %#lx.\n", relyingParty.c_str(), hr );
++        user->xstsRetryAfter[relyingParty] = now + minute;
++        return hr;
++    }
++    user->xstsRetryAfter.erase( relyingParty );
++    user->xsts[relyingParty] = *out;
++    return S_OK;
++}
++
++/* An HTTP request a token is asked for. */
++struct TokenRequest
++{
++    std::string method;
++    std::string url;
++    XboxLive::HttpHeaders headers;
++    std::vector<BYTE> body;
++};
++
++/* The token and, when the NSAL asks for one, the signature for a request.
++ * E_GAMEUSER_NO_TOKEN_REQUIRED when the NSAL gives the URL no relying party: tokens only go
++ * where it says. */
++static HRESULT GetTokenAndSignature( XUser *user, const XboxLive::NsalEndpoint *endpoint,
++                                     const XboxLive::SignaturePolicy *policy, const XboxLive::Url &url,
++                                     const TokenRequest &request, BOOL forceRefresh, std::string *token,
++                                     std::string *signature )
++{
++    XboxLive::XstsToken xsts;
++    HRESULT hr;
++
++    if ( !endpoint || endpoint->relyingParty.empty() )
++    {
++        TRACE( "%s://%s: no token.\n", url.scheme.c_str(), url.host.c_str() );
++        return E_GAMEUSER_NO_TOKEN_REQUIRED;
++    }
++    if ( endpoint->tokenType != "JWT" )
++    {
++        FIXME( "%s: token type %s not supported.\n", url.host.c_str(), endpoint->tokenType.c_str() );
++        return E_GAMEUSER_NO_TOKEN_REQUIRED;
++    }
++    if ( FAILED( hr = GetXsts( user, endpoint->relyingParty, forceRefresh, &xsts ) ) ) return hr;
++
++    *token = "XBL3.0 x=" + xsts.userHash + ";" + xsts.token;
++    signature->clear();
++    if ( policy )
++    {
++        hr = XboxLive::SignRequest( user->proofKey, *policy, request.method.c_str(), url.pathAndQuery, *token,
++                                    request.headers, request.body.data(), request.body.size(), signature );
++        if ( hr == E_NOTIMPL )
++            FIXME( "%s: signature policy version %u not supported, request not signed.\n", url.host.c_str(),
++                   policy->version );
++        else if ( FAILED( hr ) ) return hr;
++    }
++    TRACE( "%s: relying party %s, %s.\n", url.host.c_str(), endpoint->relyingParty.c_str(),
++           signature->empty() ? "not signed" : "signed" );
++    return S_OK;
++}
++
++/* The NSAL: the title's endpoints, then the default ones; shared by every user. The default
++ * list is public. The title's list takes a token from the default one. */
++static std::mutex nsalLock;
++static XboxLive::Nsal defaultNsal, nsal;
++static BOOL defaultNsalLoaded, titleNsalLoaded;
++static UINT64 defaultNsalRetryAfter, titleNsalRetryAfter;
++
++/* Called with nsalLock held; takes the user's tokensLock, never the other way round. */
++static HRESULT RequestTitleNsal( XUser *user, XboxLive::Nsal *title )
++{
++    UINT32 titleId = GetGameConfig().titleId;
++    std::string token, signature, path;
++    TokenRequest request;
++    XboxLive::Url url;
++    HRESULT hr;
++
++    if ( !titleId ) return E_GAMEUSER_NO_TITLE_ID;
++    /* Unlike the default list, the title's refuses "?type=1" (HTTP 414). */
++    path = "/titles/" + std::to_string( titleId ) + "/endpoints";
++    request.method = "GET";
++    request.url = "https://title.mgt.xboxlive.com" + path;
++    XboxLive::ParseUrl( request.url.c_str(), &url );
++
++    const XboxLive::NsalEndpoint *endpoint = defaultNsal.Find( url );
++    const XboxLive::SignaturePolicy *policy = endpoint && endpoint->signaturePolicy >= 0 ?
++                                              &defaultNsal.policies[endpoint->signaturePolicy] : nullptr;
++    if ( FAILED( hr = GetTokenAndSignature( user, endpoint, policy, url, request, FALSE, &token, &signature ) ) )
++        return hr;
++
++    std::wstring headers = L"Authorization: " + XboxLive::Widen( token ) + L"\r\n";
++    if ( !signature.empty() ) headers += L"Signature: " + XboxLive::Widen( signature ) + L"\r\n";
++    return XboxLive::RequestNsal( XboxLive::Widen( path ), headers, title );
++}
++
++/* Load what is missing of the NSAL, retrying a failed list after a minute. Only a missing
++ * default list is an error: without the title's, its own services get no tokens. */
++static HRESULT LoadNsal( XUser *user )
++{
++    const std::lock_guard<std::mutex> lock( nsalLock );
++    UINT64 now = XboxLive::Now();
++    XboxLive::Nsal title;
++    HRESULT hr;
++
++    if ( !defaultNsalLoaded )
++    {
++        if ( now < defaultNsalRetryAfter ) return E_GAMEUSER_FAILED_TO_GET_TOKEN;
++        if ( FAILED( hr = XboxLive::RequestNsal( L"/titles/default/endpoints?type=1", std::wstring(), &defaultNsal ) ) )
++        {
++            WARN( "the default NSAL is unavailable, hr %#lx.\n", hr );
++            defaultNsal = XboxLive::Nsal();
++            defaultNsalRetryAfter = now + minute;
++            return hr;
++        }
++        defaultNsalLoaded = TRUE;
++        nsal = defaultNsal;
++    }
++    if ( !titleNsalLoaded && now >= titleNsalRetryAfter )
++    {
++        if ( FAILED( hr = RequestTitleNsal( user, &title ) ) )
++        {
++            WARN( "the title's NSAL is unavailable, hr %#lx.\n", hr );
++            titleNsalRetryAfter = now + minute;
++        }
++        else
++        {
++            TRACE( "NSAL: %zu endpoints of the title, %zu default ones.\n", title.endpoints.size(),
++                   defaultNsal.endpoints.size() );
++            titleNsalLoaded = TRUE;
++            nsal = std::move( title );
++            nsal.Append( defaultNsal );
++        }
++    }
++    return S_OK;
++}
++
++static const char tokenIdentity[] = "XUserGetTokenAndSignatureAsync";
++static const char tokenUtf16Identity[] = "XUserGetTokenAndSignatureUtf16Async";
++
++struct TokenContext
++{
++    XUser *user = nullptr;
++    BOOL forceRefresh = FALSE;
++    BOOL utf16 = FALSE;
++    TokenRequest request;
++    std::string token, signature;
++};
++
++static HRESULT ComputeTokenAndSignature( TokenContext *context )
++{
++    XboxLive::NsalEndpoint endpoint;
++    XboxLive::SignaturePolicy policy;
++    BOOL found = FALSE, signs = FALSE;
++    XboxLive::Url url;
++    HRESULT hr;
++
++    if ( !XboxLive::ParseUrl( context->request.url.c_str(), &url ) ) return E_INVALIDARG;
++    if ( FAILED( hr = LoadNsal( context->user ) ) ) return hr;
++    {
++        const std::lock_guard<std::mutex> lock( nsalLock );
++        if ( const XboxLive::NsalEndpoint *match = nsal.Find( url ) )
++        {
++            endpoint = *match;
++            found = TRUE;
++            if ( ( signs = match->signaturePolicy >= 0 ) ) policy = nsal.policies[match->signaturePolicy];
++        }
++    }
++    return GetTokenAndSignature( context->user, found ? &endpoint : nullptr, signs ? &policy : nullptr, url,
++                                 context->request, context->forceRefresh, &context->token, &context->signature );
++}
++
++/* The result: the structure, then the token and the signature, each with a terminating NUL that
++ * the sizes count (as Xal documents). A request that is not signed has a null signature. */
++static SIZE_T TokenResultSize( const TokenContext &context )
++{
++    SIZE_T characters = context.token.size() + 1 + ( context.signature.empty() ? 0 : context.signature.size() + 1 );
++    return context.utf16 ? sizeof(XUserGetTokenAndSignatureUtf16Data) + characters * sizeof(WCHAR)
++                         : sizeof(XUserGetTokenAndSignatureData) + characters;
++}
++
++template <typename Data, typename Char> static void WriteTokenResult( const TokenContext &context, void *buffer )
++{
++    auto *result = static_cast<Data *>(buffer);
++    Char *text = reinterpret_cast<Char *>(result + 1);
++
++    /* Tokens and signatures are ASCII. */
++    auto copy = [&text]( const std::string &value ) -> const Char *
++    {
++        const Char *start = text;
++        for ( char c : value ) *text++ = (Char)c;
++        *text++ = 0;
++        return start;
++    };
++    result->token = copy( context.token );
++    result->signature = context.signature.empty() ? nullptr : copy( context.signature );
++    if constexpr ( sizeof(Char) == sizeof(char) )
++    {
++        result->tokenSize = context.token.size() + 1;
++        result->signatureSize = context.signature.empty() ? 0 : context.signature.size() + 1;
++    }
++    else
++    {
++        result->tokenCount = context.token.size() + 1;
++        result->signatureCount = context.signature.empty() ? 0 : context.signature.size() + 1;
++    }
++}
++
++static HRESULT CALLBACK TokenProvider( XAsyncOp op, const XAsyncProviderData *data )
++{
++    auto *context = static_cast<TokenContext *>(data->context);
++
++    switch ( op )
++    {
++        case XAsyncOp::Begin:
++            return XAsyncSchedule( data->async, 0 );
++
++        case XAsyncOp::DoWork:
++        {
++            HRESULT hr = ComputeTokenAndSignature( context );
++            XAsyncComplete( data->async, hr, SUCCEEDED( hr ) ? TokenResultSize( *context ) : 0 );
++            return S_OK;
++        }
++
++        case XAsyncOp::GetResult:
++            if ( context->utf16 ) WriteTokenResult<XUserGetTokenAndSignatureUtf16Data, WCHAR>( *context, data->buffer );
++            else WriteTokenResult<XUserGetTokenAndSignatureData, char>( *context, data->buffer );
++            return S_OK;
++
++        case XAsyncOp::Cleanup:
++            Release( context->user );
++            delete context;
++            return S_OK;
++
++        default:
++            return S_OK;
++    }
++}
++
++static HRESULT BeginTokenRequest( XUser *user, XUserGetTokenAndSignatureOptions options, TokenContext *context,
++                                  XAsyncBlock *async )
++{
++    const char *identity = context->utf16 ? tokenUtf16Identity : tokenIdentity;
++    HRESULT hr;
++
++    /* AllUsers asks for a token for every signed-in user: there is only one. */
++    context->forceRefresh = ( static_cast<UINT32>(options) &
++                              static_cast<UINT32>(XUserGetTokenAndSignatureOptions::ForceRefresh) ) != 0;
++    AddRef( user );
++    context->user = user;
++    if ( FAILED( hr = XAsyncBegin( async, context, identity, identity, TokenProvider ) ) )
++    {
++        Release( user );
++        delete context;
++    }
++    return hr;
++}
++
++/* There is no sign-out or profile change to report: registrations only get a token. */
++static std::atomic<UINT64> nextChangeToken{ 1 };
++
++class XUserImpl :
++    public IXUserImpl6,
++    public IXUserGamertagImpl
++{
++public:
++    /* IUnknown, shared by both interfaces */
++    HRESULT WINAPI QueryInterface( REFIID iid, void **out ) noexcept override
++    {
++        TRACE( "iface %p, iid %s, out %p.\n", this, debugstr_guid( &iid ), out );
++
++        if ( !out ) return E_POINTER;
++        *out = nullptr;
++
++        if ( iid == __uuidof( IUnknown ) || iid == __uuidof( IXUserImpl ) || iid == __uuidof( IXUserImpl2 ) ||
++             iid == __uuidof( IXUserImpl3 ) || iid == __uuidof( IXUserImpl4 ) || iid == __uuidof( IXUserImpl5 ) ||
++             iid == __uuidof( IXUserImpl6 ) )
++            *out = static_cast<IXUserImpl6 *>(this);
++        else if ( iid == __uuidof( IXUserGamertagImpl ) )
++            *out = static_cast<IXUserGamertagImpl *>(this);
++        else
++        {
++            FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &iid ) );
++            return E_NOINTERFACE;
++        }
++        AddRef();
++        return S_OK;
++    }
++
++    ULONG WINAPI AddRef() noexcept override { return static_cast<ULONG>(++ref); }
++
++    // A static object: never deleted.
++    ULONG WINAPI Release() noexcept override { return static_cast<ULONG>(--ref); }
++
++    /* IXUserImpl */
++    HRESULT WINAPI XUserDuplicateHandle( XUserHandle handle, XUserHandle *duplicatedHandle ) override
++    {
++        if ( !handle ) return E_INVALIDARG;
++        if ( !duplicatedHandle ) return E_POINTER;
++        ::AddRef( handle );
++        *duplicatedHandle = handle;
++        return S_OK;
++    }
++
++    void WINAPI XUserCloseHandle( XUserHandle user ) override
++    {
++        if ( user ) ::Release( user );
++    }
++
++    INT32 WINAPI XUserCompare( XUserHandle user1, XUserHandle user2 ) override
++    {
++        UINT64 a = user1 ? user1->localId : 0, b = user2 ? user2->localId : 0;
++        return a < b ? -1 : a > b ? 1 : 0;
++    }
++
++    HRESULT WINAPI XUserGetMaxUsers( UINT32 *maxUsers ) override
++    {
++        if ( !maxUsers ) return E_POINTER;
++        *maxUsers = 1; /* as on a PC */
++        return S_OK;
++    }
++
++    HRESULT WINAPI XUserAddAsync( XUserAddOptions options, XAsyncBlock *async ) override
++    {
++        HRESULT hr;
++
++        TRACE( "options %#x, async %p.\n", static_cast<UINT32>(options), async );
++        if ( !async ) return E_POINTER;
++        auto *context = new AddContext{ options };
++        if ( FAILED( hr = XAsyncBegin( async, context, addIdentity, addIdentity, AddProvider ) ) ) delete context;
++        return hr;
++    }
++
++    HRESULT WINAPI XUserAddResult( XAsyncBlock *async, XUserHandle *newUser ) override
++    {
++        if ( !async || !newUser ) return E_POINTER;
++        return XAsyncGetResult( async, addIdentity, sizeof(*newUser), newUser, nullptr );
++    }
++
++    HRESULT WINAPI XUserGetLocalId( XUserHandle user, XUserLocalId *userLocalId ) override
++    {
++        if ( !user ) return E_INVALIDARG;
++        if ( !userLocalId ) return E_POINTER;
++        userLocalId->value = user->localId;
++        return S_OK;
++    }
++
++    HRESULT WINAPI XUserFindUserByLocalId( XUserLocalId userLocalId, XUserHandle *handle ) override
++    {
++        return FindUser( [userLocalId]( XUser *user ) { return user->localId == userLocalId.value; }, handle );
++    }
++
++    HRESULT WINAPI XUserGetId( XUserHandle user, UINT64 *userId ) override
++    {
++        if ( !user ) return E_INVALIDARG;
++        if ( !userId ) return E_POINTER;
++        *userId = user->xuid;
++        return S_OK;
++    }
++
++    HRESULT WINAPI XUserFindUserById( UINT64 userId, XUserHandle *handle ) override
++    {
++        return FindUser( [userId]( XUser *user ) { return user->xuid == userId; }, handle );
++    }
++
++    HRESULT WINAPI XUserGetIsGuest( XUserHandle user, BOOLEAN *isGuest ) override
++    {
++        if ( !user ) return E_INVALIDARG;
++        if ( !isGuest ) return E_POINTER;
++        *isGuest = FALSE;
++        return S_OK;
++    }
++
++    HRESULT WINAPI XUserGetState( XUserHandle user, XUserState *state ) override
++    {
++        if ( !user ) return E_INVALIDARG;
++        if ( !state ) return E_POINTER;
++        *state = XUserState::SignedIn;
++        return S_OK;
++    }
++
++    HRESULT WINAPI __PADDING__() override
++    {
++        FIXME( "stub!\n" );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XUserGetGamerPictureAsync( XUserHandle user, XUserGamerPictureSize pictureSize,
++                                              XAsyncBlock *async ) override
++    {
++        FIXME( "user %p, pictureSize %u stub!\n", user, static_cast<UINT32>(pictureSize) );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XUserGetGamerPictureResultSize( XAsyncBlock *async, SIZE_T *bufferSize ) override { return E_NOTIMPL; }
++
++    HRESULT WINAPI XUserGetGamerPictureResult( XAsyncBlock *async, SIZE_T bufferSize, void *buffer,
++                                               SIZE_T *bufferUsed ) override
++    {
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XUserGetAgeGroup( XUserHandle user, XUserAgeGroup *ageGroup ) override
++    {
++        if ( !user ) return E_INVALIDARG;
++        if ( !ageGroup ) return E_POINTER;
++        *ageGroup = user->ageGroup;
++        return S_OK;
++    }
++
++    /* From the XSTS "prv" claim: the privileges the account has. */
++    HRESULT WINAPI XUserCheckPrivilege( XUserHandle user, XUserPrivilegeOptions options, XUserPrivilege privilege,
++                                        BOOLEAN *hasPrivilege, XUserPrivilegeDenyReason *reason ) override
++    {
++        if ( !user ) return E_INVALIDARG;
++        if ( !hasPrivilege ) return E_POINTER;
++        *hasPrivilege = user->privileges.count( static_cast<UINT32>(privilege) ) != 0;
++        if ( reason ) *reason = *hasPrivilege ? XUserPrivilegeDenyReason::None : XUserPrivilegeDenyReason::Restricted;
++        TRACE( "privilege %u: %d.\n", static_cast<UINT32>(privilege), *hasPrivilege );
++        return S_OK;
++    }
++
++    HRESULT WINAPI XUserResolvePrivilegeWithUiAsync( XUserHandle user, XUserPrivilegeOptions options,
++                                                     XUserPrivilege privilege, XAsyncBlock *async ) override
++    {
++        FIXME( "privilege %u stub!\n", static_cast<UINT32>(privilege) );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XUserResolvePrivilegeWithUiResult( XAsyncBlock *async ) override { return E_NOTIMPL; }
++
++    /* Tokens for the relying party the NSAL gives the URL, signed as its policy says. */
++    HRESULT WINAPI XUserGetTokenAndSignatureAsync( XUserHandle user, XUserGetTokenAndSignatureOptions options,
++            const char *method, const char *url, SIZE_T headerCount, const XUserGetTokenAndSignatureHttpHeader headers[],
++            SIZE_T bodySize, const void *bodyBuffer, XAsyncBlock *async ) override
++    {
++        if ( !user || !method || !url || ( headerCount && !headers ) || ( bodySize && !bodyBuffer ) ) return E_INVALIDARG;
++        if ( !async ) return E_POINTER;
++        for ( SIZE_T i = 0; i < headerCount; ++i )
++            if ( !headers[i].name || !headers[i].value ) return E_INVALIDARG;
++
++        auto *context = new TokenContext();
++        context->request.method = method;
++        context->request.url = url;
++        for ( SIZE_T i = 0; i < headerCount; ++i ) context->request.headers.emplace_back( headers[i].name, headers[i].value );
++        context->request.body.assign( static_cast<const BYTE *>(bodyBuffer), static_cast<const BYTE *>(bodyBuffer) + bodySize );
++        return BeginTokenRequest( user, options, context, async );
++    }
++
++    HRESULT WINAPI XUserGetTokenAndSignatureResultSize( XAsyncBlock *async, SIZE_T *bufferSize ) override
++    {
++        if ( !async || !bufferSize ) return E_POINTER;
++        return XAsyncGetResultSize( async, bufferSize );
++    }
++
++    HRESULT WINAPI XUserGetTokenAndSignatureResult( XAsyncBlock *async, SIZE_T bufferSize, void *buffer,
++                                                    XUserGetTokenAndSignatureData **ptrToBuffer, SIZE_T *bufferUsed ) override
++    {
++        HRESULT hr;
++
++        if ( !async || !ptrToBuffer ) return E_POINTER;
++        if ( SUCCEEDED( hr = XAsyncGetResult( async, tokenIdentity, bufferSize, buffer, bufferUsed ) ) )
++            *ptrToBuffer = static_cast<XUserGetTokenAndSignatureData *>(buffer);
++        return hr;
++    }
++
++    HRESULT WINAPI XUserGetTokenAndSignatureUtf16Async( XUserHandle user, XUserGetTokenAndSignatureOptions options,
++            const WCHAR *method, const WCHAR *url, SIZE_T headerCount,
++            const XUserGetTokenAndSignatureUtf16HttpHeader headers[], SIZE_T bodySize, const void *bodyBuffer,
++            XAsyncBlock *async ) override
++    {
++        if ( !user || !method || !url || ( headerCount && !headers ) || ( bodySize && !bodyBuffer ) ) return E_INVALIDARG;
++        if ( !async ) return E_POINTER;
++        for ( SIZE_T i = 0; i < headerCount; ++i )
++            if ( !headers[i].name || !headers[i].value ) return E_INVALIDARG;
++
++        auto *context = new TokenContext();
++        context->utf16 = TRUE;
++        context->request.method = XboxLive::Narrow( method );
++        context->request.url = XboxLive::Narrow( url );
++        for ( SIZE_T i = 0; i < headerCount; ++i )
++            context->request.headers.emplace_back( XboxLive::Narrow( headers[i].name ),
++                                                   XboxLive::Narrow( headers[i].value ) );
++        context->request.body.assign( static_cast<const BYTE *>(bodyBuffer), static_cast<const BYTE *>(bodyBuffer) + bodySize );
++        return BeginTokenRequest( user, options, context, async );
++    }
++
++    HRESULT WINAPI XUserGetTokenAndSignatureUtf16ResultSize( XAsyncBlock *async, SIZE_T *bufferSize ) override
++    {
++        if ( !async || !bufferSize ) return E_POINTER;
++        return XAsyncGetResultSize( async, bufferSize );
++    }
++
++    HRESULT WINAPI XUserGetTokenAndSignatureUtf16Result( XAsyncBlock *async, SIZE_T bufferSize, void *buffer,
++            XUserGetTokenAndSignatureUtf16Data **ptrToBuffer, SIZE_T *bufferUsed ) override
++    {
++        HRESULT hr;
++
++        if ( !async || !ptrToBuffer ) return E_POINTER;
++        if ( SUCCEEDED( hr = XAsyncGetResult( async, tokenUtf16Identity, bufferSize, buffer, bufferUsed ) ) )
++            *ptrToBuffer = static_cast<XUserGetTokenAndSignatureUtf16Data *>(buffer);
++        return hr;
++    }
++
++    HRESULT WINAPI XUserResolveIssueWithUiAsync( XUserHandle user, const char *url, XAsyncBlock *async ) override
++    {
++        FIXME( "url %s stub!\n", url ? url : "(null)" );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XUserResolveIssueWithUiResult( XAsyncBlock *async ) override { return E_NOTIMPL; }
++
++    HRESULT WINAPI XUserResolveIssueWithUiUtf16Async( XUserHandle user, const WCHAR *url, XAsyncBlock *async ) override
++    {
++        FIXME( "url %s stub!\n", url ? XboxLive::Narrow( url ).c_str() : "(null)" );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XUserResolveIssueWithUiUtf16Result( XAsyncBlock *async ) override { return E_NOTIMPL; }
++
++    HRESULT WINAPI XUserRegisterForChangeEvent( XTaskQueueHandle queue, void *context, XUserChangeEventCallback *callback,
++                                                XTaskQueueRegistrationToken *token ) override
++    {
++        if ( !callback || !token ) return E_POINTER;
++        token->token = nextChangeToken++;
++        return S_OK;
++    }
++
++    BOOLEAN WINAPI XUserUnregisterForChangeEvent( XTaskQueueRegistrationToken token, BOOLEAN wait ) override
++    {
++        return TRUE;
++    }
++
++    HRESULT WINAPI XUserGetSignOutDeferral( XUserSignOutDeferralHandle *deferral ) override
++    {
++        if ( !deferral ) return E_POINTER;
++        return E_GAMEUSER_DEFERRAL_NOT_AVAILABLE; /* no sign-out is ever in progress */
++    }
++
++    void WINAPI XUserCloseSignOutDeferralHandle( XUserSignOutDeferralHandle deferral ) override {}
++
++    /* IXUserImpl2 */
++    HRESULT WINAPI XUserAddByIdWithUiAsync( UINT64 userId, XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XUserAddByIdWithUiResult( XAsyncBlock *async, XUserHandle *newUser ) override { return E_NOTIMPL; }
++
++    /* IXUserImpl3 */
++    HRESULT WINAPI XUserGetMsaTokenSilentlyAsync( XUserHandle user, XUserGetMsaTokenSilentlyOptions options,
++                                                  const char *scope, XAsyncBlock *async ) override
++    {
++        FIXME( "scope %s stub!\n", scope ? scope : "(null)" );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XUserGetMsaTokenSilentlyResult( XAsyncBlock *async, SIZE_T resultTokenSize, char *resultToken,
++                                                   SIZE_T *resultTokenUsed ) override
++    {
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XUserGetMsaTokenSilentlyResultSize( XAsyncBlock *async, SIZE_T *tokenSize ) override { return E_NOTIMPL; }
++
++    /* IXUserImpl4 */
++    BOOLEAN WINAPI XUserIsStoreUser( XUserHandle user ) override
++    {
++        return user != nullptr; /* the only user is the one the title runs as */
++    }
++
++    /* IXUserImpl5: no platform prompts are ever shown, so handlers are accepted and never called. */
++    HRESULT WINAPI XUserPlatformRemoteConnectSetEventHandlers( XTaskQueueHandle queue,
++                                                               XUserPlatformRemoteConnectEventHandlers *handlers ) override
++    {
++        return S_OK;
++    }
++
++    HRESULT WINAPI XUserPlatformRemoteConnectCancelPrompt( XUserPlatformOperation operation ) override { return E_INVALIDARG; }
++
++    HRESULT WINAPI XUserPlatformSpopPromptSetEventHandlers( XTaskQueueHandle queue,
++                                                            XUserPlatformSpopPromptEventHandler *handler, void *context ) override
++    {
++        return S_OK;
++    }
++
++    HRESULT WINAPI XUserPlatformSpopPromptComplete( XUserPlatformOperation operation,
++                                                    XUserPlatformOperationResult result ) override
++    {
++        return E_INVALIDARG;
++    }
++
++    /* IXUserImpl6 */
++    BOOLEAN WINAPI XUserIsSignOutPresent() override { return FALSE; }
++    HRESULT WINAPI XUserSignOutAsync( XUserHandle user, XAsyncBlock *async ) override
++    {
++        FIXME( "stub!\n" );
++        return E_NOTIMPL;
++    }
++
++    HRESULT WINAPI XUserSignOutResult( XAsyncBlock *async ) override { return E_NOTIMPL; }
++
++    /* IXUserGamertagImpl */
++    HRESULT WINAPI XUserGetGamertag( XUserHandle user, XUserGamertagComponent component, SIZE_T size, char *gamertag,
++                                     SIZE_T *used ) override
++    {
++        const std::string *text;
++
++        if ( !user ) return E_INVALIDARG;
++        if ( !gamertag ) return E_POINTER;
++        switch ( component )
++        {
++            case XUserGamertagComponent::Classic: text = &user->gamertag; break;
++            case XUserGamertagComponent::Modern:
++                text = user->modernGamertag.empty() ? &user->gamertag : &user->modernGamertag;
++                break;
++            case XUserGamertagComponent::ModernSuffix: text = &user->modernSuffix; break;
++            case XUserGamertagComponent::UniqueModern:
++                text = user->uniqueModern.empty() ? &user->gamertag : &user->uniqueModern;
++                break;
++            default: return E_INVALIDARG;
++        }
++        if ( size < text->size() + 1 ) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
++        memcpy( gamertag, text->c_str(), text->size() + 1 );
++        if ( used ) *used = text->size() + 1;
++        return S_OK;
++    }
++
++private:
++    template <typename Match> static HRESULT FindUser( Match match, XUserHandle *handle )
++    {
++        if ( !handle ) return E_POINTER;
++        const std::lock_guard<std::mutex> lock( usersLock );
++        if ( !signedInUser || !match( signedInUser ) ) return E_GAMEUSER_USER_NOT_FOUND;
++        ::AddRef( signedInUser );
++        *handle = signedInUser;
++        return S_OK;
++    }
++
++    std::atomic_long ref{ 1 };
++};
++
++static XUserImpl g_x_user;
++
++IXUserImpl6 *x_user = static_cast<IXUserImpl6 *>(&g_x_user);
+diff --git a/src/System/XboxLive.cpp b/src/System/XboxLive.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..dfb42796cf215d9f100a9cdefa0987e19ef002ea
+--- /dev/null
++++ b/src/System/XboxLive.cpp
+@@ -0,0 +1,561 @@
++/*
++ * Xbox Game runtime Library
++ *  Xbox Live authentication: HTTP, JSON, proof key, user and XSTS tokens, NSAL, signatures
++ *
++ * RPS tickets from Xodus become a device token and, through SISU, title, user and XSTS tokens
++ * bound to an ECDSA P-256 proof key, as Xal does; the user token alone, then an XSTS token, as
++ * WineGDK's XUser.c (LGPL-2.1-or-later) did. Written anew in C++.
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "XboxLive.h"
++
++#include <winhttp.h>
++#include <roapi.h>
++#include <winstring.h>
++#ifdef GetObject
++#undef GetObject /* wingdi's macro would rename IJsonValue::GetObject */
++#endif
++#include <windows.data.json.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++using namespace ABI::Windows::Data::Json;
++
++namespace XboxLive
++{
++
++/* Releases a COM pointer when it goes out of scope. */
++template <typename T> class Ref
++{
++public:
++    Ref() = default;
++    Ref( const Ref & ) = delete;
++    Ref &operator=( const Ref & ) = delete;
++    ~Ref() { if ( p ) p->Release(); }
++    T **operator&() { return &p; }
++    T *operator->() const { return p; }
++    T *get() const { return p; }
++    void reset() { if ( p ) p->Release(); p = nullptr; }
++
++private:
++    T *p = nullptr;
++};
++
++/* Closes a WinHTTP handle when it goes out of scope. */
++class Internet
++{
++public:
++    explicit Internet( HINTERNET handle = nullptr ) : h( handle ) {}
++    Internet( const Internet & ) = delete;
++    Internet &operator=( const Internet & ) = delete;
++    ~Internet() { if ( h ) WinHttpCloseHandle( h ); }
++    HINTERNET get() const { return h; }
++
++private:
++    HINTERNET h;
++};
++
++/* Deletes an HSTRING when it goes out of scope. */
++class String
++{
++public:
++    String() = default;
++    String( const String & ) = delete;
++    String &operator=( const String & ) = delete;
++    ~String() { WindowsDeleteString( s ); }
++    HSTRING *operator&() { return &s; }
++    HSTRING get() const { return s; }
++
++private:
++    HSTRING s = nullptr;
++};
++
++std::wstring Widen( const std::string &text )
++{
++    int length = MultiByteToWideChar( CP_UTF8, 0, text.data(), (int)text.size(), nullptr, 0 );
++    std::wstring wide( length, L'\0' );
++    MultiByteToWideChar( CP_UTF8, 0, text.data(), (int)text.size(), wide.data(), length );
++    return wide;
++}
++
++std::string Narrow( const wchar_t *text, int length )
++{
++    if ( length < 0 ) length = (int)wcslen( text );
++    int size = WideCharToMultiByte( CP_UTF8, 0, text, length, nullptr, 0, nullptr, nullptr );
++    std::string narrow( size, '\0' );
++    WideCharToMultiByte( CP_UTF8, 0, text, length, narrow.data(), size, nullptr, nullptr );
++    return narrow;
++}
++
++std::string Narrow( HSTRING text )
++{
++    UINT32 length;
++    const WCHAR *wide = WindowsGetStringRawBuffer( text, &length );
++    return Narrow( wide, (int)length );
++}
++
++static HRESULT MakeString( const wchar_t *text, HSTRING *out )
++{
++    return WindowsCreateString( text, (UINT32)wcslen( text ), out );
++}
++
++/* Escape text for a JSON string literal. */
++static std::string JsonEscape( const std::string &text )
++{
++    std::string escaped;
++    for ( unsigned char c : text )
++    {
++        if ( c == '"' || c == '\\' ) { escaped += '\\'; escaped += (char)c; }
++        else if ( c < 0x20 ) { char hex[8]; snprintf( hex, sizeof(hex), "\\u%04x", c ); escaped += hex; }
++        else escaped += (char)c;
++    }
++    return escaped;
++}
++
++/* One attempt; *error gets WinHTTP's error code on failure. */
++static HRESULT HttpAttempt( const wchar_t *method, const wchar_t *host, const wchar_t *path, const std::wstring &headers,
++                            const std::string &body, DWORD *status, std::string *response, DWORD *error )
++{
++    DWORD size = sizeof(*status), available;
++    auto fail = [error]() { *error = GetLastError(); return HRESULT_FROM_WIN32( *error ); };
++
++    Internet session( WinHttpOpen( L"xgameruntime", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
++                                   WINHTTP_NO_PROXY_BYPASS, 0 ) );
++    if ( !session.get() ) return fail();
++    WinHttpSetTimeouts( session.get(), 10000, 10000, 20000, 20000 );
++
++    Internet connection( WinHttpConnect( session.get(), host, INTERNET_DEFAULT_HTTPS_PORT, 0 ) );
++    if ( !connection.get() ) return fail();
++    Internet request( WinHttpOpenRequest( connection.get(), method, path, nullptr, WINHTTP_NO_REFERER,
++                                          WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE ) );
++    if ( !request.get() ) return fail();
++
++    if ( !WinHttpSendRequest( request.get(), headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
++                              headers.empty() ? 0 : (DWORD)-1L, (void *)body.data(), (DWORD)body.size(),
++                              (DWORD)body.size(), 0 ) ||
++         !WinHttpReceiveResponse( request.get(), nullptr ) ||
++         !WinHttpQueryHeaders( request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
++                               WINHTTP_HEADER_NAME_BY_INDEX, status, &size, WINHTTP_NO_HEADER_INDEX ) )
++        return fail();
++
++    response->clear();
++    for ( ;; )
++    {
++        if ( !WinHttpQueryDataAvailable( request.get(), &available ) ) return fail();
++        if ( !available ) break;
++        std::vector<char> chunk( available );
++        DWORD read = 0;
++        if ( !WinHttpReadData( request.get(), chunk.data(), available, &read ) ) return fail();
++        response->append( chunk.data(), read );
++    }
++    return S_OK;
++}
++
++HRESULT HttpRequest( const wchar_t *method, const wchar_t *host, const wchar_t *path, const std::wstring &headers,
++                     const std::string &body, DWORD *status, std::string *response )
++{
++    std::string name = Narrow( host );
++    DWORD error = 0;
++    HRESULT hr;
++
++    hr = HttpAttempt( method, host, path, headers, body, status, response, &error );
++    /* A connection the server closed while it was idle fails the next request on it: GETs, which
++     * change nothing, are tried once more. */
++    if ( FAILED( hr ) && !wcscmp( method, L"GET" ) )
++    {
++        WARN( "GET %s: WinHTTP error %lu, trying again.\n", name.c_str(), error );
++        hr = HttpAttempt( method, host, path, headers, body, status, response, &error );
++    }
++    if ( FAILED( hr ) ) WARN( "%s: WinHTTP error %lu.\n", name.c_str(), error );
++    return hr;
++}
++
++UINT64 Now()
++{
++    FILETIME now;
++
++    GetSystemTimeAsFileTime( &now );
++    return (UINT64)now.dwHighDateTime << 32 | now.dwLowDateTime;
++}
++
++/* An ISO 8601 UTC time ("2026-10-07T08:00:29.3191631Z") as a FILETIME, without the fraction of a
++ * second; 0 if it does not parse. */
++static UINT64 ParseTime( const std::string &text )
++{
++    unsigned year, month, day, hour, minute, second;
++    SYSTEMTIME time{};
++    FILETIME file;
++
++    if ( sscanf( text.c_str(), "%4u-%2u-%2uT%2u:%2u:%2u", &year, &month, &day, &hour, &minute, &second ) != 6 )
++        return 0;
++    time.wYear = (WORD)year; time.wMonth = (WORD)month; time.wDay = (WORD)day;
++    time.wHour = (WORD)hour; time.wMinute = (WORD)minute; time.wSecond = (WORD)second;
++    if ( !SystemTimeToFileTime( &time, &file ) ) return 0;
++    return (UINT64)file.dwHighDateTime << 32 | file.dwLowDateTime;
++}
++
++ProofKey::~ProofKey()
++{
++    if ( key ) BCryptDestroyKey( key );
++    if ( algorithm ) BCryptCloseAlgorithmProvider( algorithm, 0 );
++}
++
++HRESULT ProofKey::Generate()
++{
++    BYTE blob[sizeof(BCRYPT_ECCKEY_BLOB) + 64];
++    ULONG size = 0;
++    NTSTATUS status;
++
++    if ( !BCRYPT_SUCCESS( status = BCryptOpenAlgorithmProvider( &algorithm, BCRYPT_ECDSA_P256_ALGORITHM, nullptr, 0 ) ) ||
++         !BCRYPT_SUCCESS( status = BCryptGenerateKeyPair( algorithm, &key, 256, 0 ) ) ||
++         !BCRYPT_SUCCESS( status = BCryptFinalizeKeyPair( key, 0 ) ) ||
++         !BCRYPT_SUCCESS( status = BCryptExportKey( key, nullptr, BCRYPT_ECCPUBLIC_BLOB, blob, sizeof(blob), &size, 0 ) ) )
++        return HRESULT_FROM_NT( status );
++
++    const BYTE *x = blob + sizeof(BCRYPT_ECCKEY_BLOB), *y = x + 32;
++    jwk = "{\"crv\":\"P-256\",\"alg\":\"ES256\",\"use\":\"sig\",\"kty\":\"EC\",\"x\":\"" + Base64( x, 32, TRUE ) +
++          "\",\"y\":\"" + Base64( y, 32, TRUE ) + "\"}";
++    return S_OK;
++}
++
++HRESULT ProofKey::Sign( const BYTE *data, SIZE_T size, BYTE signature[64] ) const
++{
++    BYTE hash[32];
++    ULONG used = 0;
++    NTSTATUS status;
++
++    if ( !key ) return E_NOT_VALID_STATE;
++    if ( !BCRYPT_SUCCESS( status = BCryptHash( BCRYPT_SHA256_ALG_HANDLE, nullptr, 0, (PUCHAR)data, (ULONG)size,
++                                               hash, sizeof(hash) ) ) ||
++         !BCRYPT_SUCCESS( status = BCryptSignHash( key, nullptr, hash, sizeof(hash), signature, 64, &used, 0 ) ) )
++        return HRESULT_FROM_NT( status );
++    return used == 64 ? S_OK : E_UNEXPECTED;
++}
++
++/* Parse a JSON object from UTF-8 text with Windows.Data.Json. */
++static HRESULT ParseObject( const std::string &text, IJsonObject **object )
++{
++    Ref<IJsonValueStatics> statics;
++    Ref<IJsonValue> value;
++    String className, input;
++    std::wstring wide = Widen( text );
++    HRESULT hr;
++
++    if ( FAILED( hr = MakeString( RuntimeClass_Windows_Data_Json_JsonValue, &className ) ) ||
++         FAILED( hr = RoGetActivationFactory( className.get(), __uuidof( IJsonValueStatics ), (void **)&statics ) ) ||
++         FAILED( hr = WindowsCreateString( wide.c_str(), (UINT32)wide.size(), &input ) ) ||
++         FAILED( hr = statics->Parse( input.get(), &value ) ) )
++        return hr;
++    return value->GetObject( object );
++}
++
++static HRESULT GetString( IJsonObject *object, const wchar_t *name, std::string *out )
++{
++    String key, value;
++    HRESULT hr;
++
++    if ( FAILED( hr = MakeString( name, &key ) ) || FAILED( hr = object->GetNamedString( key.get(), &value ) ) ) return hr;
++    *out = Narrow( value.get() );
++    return S_OK;
++}
++
++static HRESULT GetNumber( IJsonObject *object, const wchar_t *name, DOUBLE *out )
++{
++    String key;
++    HRESULT hr;
++
++    if ( FAILED( hr = MakeString( name, &key ) ) ) return hr;
++    return object->GetNamedNumber( key.get(), out );
++}
++
++static HRESULT GetArray( IJsonObject *object, const wchar_t *name, IJsonArray **out )
++{
++    String key;
++    HRESULT hr;
++
++    if ( FAILED( hr = MakeString( name, &key ) ) ) return hr;
++    return object->GetNamedArray( key.get(), out );
++}
++
++/* The strings of an array, which may be absent. Wine's JsonArray has no size: read up to E_BOUNDS. */
++static std::vector<std::string> GetStrings( IJsonObject *object, const wchar_t *name )
++{
++    std::vector<std::string> strings;
++    Ref<IJsonArray> array;
++
++    if ( FAILED( GetArray( object, name, &array ) ) ) return strings;
++    for ( UINT32 i = 0;; ++i )
++    {
++        String value;
++        if ( FAILED( array->GetStringAt( i, &value ) ) ) break;
++        strings.push_back( Narrow( value.get() ) );
++    }
++    return strings;
++}
++
++/* Log an Xbox Live failure without anything secret: the HTTP status and the XErr code. */
++static HRESULT Failure( const char *what, DWORD status, const std::string &response )
++{
++    const char *xerr = strstr( response.c_str(), "\"XErr\":" );
++    WARN( "%s failed: HTTP %lu, XErr %s.\n", what, status,
++          xerr ? std::string( xerr + 7, strcspn( xerr + 7, ",}" ) ).c_str() : "none" );
++    return E_GAMEUSER_FAILED_TO_GET_TOKEN;
++}
++
++static const wchar_t jsonHeaders[] = L"Content-Type: application/json\r\nAccept: application/json\r\n"
++                                     L"x-xbl-contract-version: 1\r\n";
++
++/* POST to an Xbox Live authentication service, signed with the proof key under the policy of
++ * *.xboxlive.com in the default NSAL: version 1, ES256, 8 KiB of body. */
++static HRESULT PostSigned( const ProofKey &key, const wchar_t *host, const wchar_t *path, const std::wstring &headers,
++                           const std::string &body, DWORD *status, std::string *response )
++{
++    std::string signature, narrowPath;
++    SignaturePolicy policy;
++    HRESULT hr;
++
++    for ( const wchar_t *c = path; *c; ++c ) narrowPath += (char)*c;
++    policy.version = 1;
++    policy.maxBodyBytes = 8192;
++    policy.es256 = TRUE;
++    if ( FAILED( hr = SignRequest( key, policy, "POST", narrowPath, std::string(), HttpHeaders(),
++                                   reinterpret_cast<const BYTE *>(body.data()), body.size(), &signature ) ) )
++        return hr;
++    return HttpRequest( L"POST", host, path, headers + L"Signature: " + Widen( signature ) + L"\r\n", body, status,
++                        response );
++}
++
++/* A token and its expiry ("Token" and "NotAfter"; 0 without one) from an object of a response. */
++static HRESULT ReadToken( IJsonObject *object, std::string *token, UINT64 *notAfter )
++{
++    std::string expiry;
++    HRESULT hr;
++
++    if ( FAILED( hr = GetString( object, L"Token", token ) ) ) return hr;
++    *notAfter = SUCCEEDED( GetString( object, L"NotAfter", &expiry ) ) ? ParseTime( expiry ) : 0;
++    return S_OK;
++}
++
++/* The token, expiry (an hour when the response has none) and user claims of an XSTS response. */
++static HRESULT ParseXsts( IJsonObject *object, XstsToken *xsts )
++{
++    Ref<IJsonObject> claims, user;
++    Ref<IJsonArray> users;
++    String claimsName;
++    std::string xid;
++    HRESULT hr;
++
++    if ( FAILED( hr = ReadToken( object, &xsts->token, &xsts->notAfter ) ) ||
++         FAILED( hr = MakeString( L"DisplayClaims", &claimsName ) ) ||
++         FAILED( hr = object->GetNamedObject( claimsName.get(), &claims ) ) ||
++         FAILED( hr = GetArray( claims.get(), L"xui", &users ) ) ||
++         FAILED( hr = users->GetObjectAt( 0, &user ) ) ||
++         FAILED( hr = GetString( user.get(), L"uhs", &xsts->userHash ) ) )
++        return hr;
++    if ( !xsts->notAfter ) xsts->notAfter = Now() + 3600ull * 10000000;
++
++    /* Not every relying party carries every claim. */
++    if ( SUCCEEDED( GetString( user.get(), L"xid", &xid ) ) ) xsts->xuid = strtoull( xid.c_str(), nullptr, 10 );
++    GetString( user.get(), L"gtg", &xsts->gamertag );
++    GetString( user.get(), L"mgt", &xsts->modernGamertag );
++    GetString( user.get(), L"mgs", &xsts->modernSuffix );
++    GetString( user.get(), L"umg", &xsts->uniqueModern );
++    GetString( user.get(), L"agg", &xsts->ageGroup );
++    GetString( user.get(), L"prv", &xsts->privileges );
++    return S_OK;
++}
++
++/* A token and its expiry from a member of a response ("TitleToken": {"Token": ..., "NotAfter": ...}). */
++static HRESULT GetToken( IJsonObject *object, const wchar_t *name, std::string *token, UINT64 *notAfter )
++{
++    Ref<IJsonObject> member;
++    String key;
++    HRESULT hr;
++
++    if ( FAILED( hr = MakeString( name, &key ) ) || FAILED( hr = object->GetNamedObject( key.get(), &member ) ) )
++        return hr;
++    return ReadToken( member.get(), token, notAfter );
++}
++
++HRESULT RequestDeviceToken( const std::string &deviceTicket, const ProofKey &key, std::string *deviceToken,
++                            UINT64 *notAfter )
++{
++    std::string body = "{\"RelyingParty\":\"http://auth.xboxlive.com\",\"TokenType\":\"JWT\",\"Properties\":{"
++                       "\"AuthMethod\":\"RPS\",\"RpsTicket\":\"" + JsonEscape( deviceTicket ) + "\","
++                       "\"SiteName\":\"user.auth.xboxlive.com\",\"Version\":\"10.0.22621\",\"ProofKey\":" +
++                       key.Jwk() + "}}";
++    Ref<IJsonObject> object;
++    std::string response;
++    DWORD status = 0;
++    HRESULT hr;
++
++    if ( FAILED( hr = PostSigned( key, L"device.auth.xboxlive.com", L"/device/authenticate", jsonHeaders, body,
++                                  &status, &response ) ) )
++        return hr;
++    if ( status != 200 ) return Failure( "device token", status, response );
++    if ( FAILED( hr = ParseObject( response, &object ) ) ) return hr;
++    return ReadToken( object.get(), deviceToken, notAfter );
++}
++
++HRESULT SisuAuthorize( const std::string &rpsTicket, const char *appId, const std::string &deviceToken,
++                       const ProofKey &key, SisuTokens *tokens )
++{
++    static const wchar_t sisuHeaders[] = L"Content-Type: application/json\r\nAccept: application/json\r\n";
++    std::string body = "{\"AccessToken\":\"" + JsonEscape( rpsTicket ) + "\",\"AppId\":\"" + JsonEscape( appId ) +
++                       "\",\"DeviceToken\":\"" + JsonEscape( deviceToken ) + "\",\"Sandbox\":\"RETAIL\","
++                       "\"SiteName\":\"user.auth.xboxlive.com\",\"ProofKey\":" + key.Jwk() + "}";
++    Ref<IJsonObject> object, authorization;
++    std::string response;
++    String authorizationName;
++    DWORD status = 0;
++    HRESULT hr;
++
++    if ( FAILED( hr = PostSigned( key, L"sisu.xboxlive.com", L"/authorize", sisuHeaders, body, &status, &response ) ) )
++        return hr;
++    if ( status != 200 ) return Failure( "SISU authorization", status, response );
++    if ( FAILED( hr = ParseObject( response, &object ) ) ||
++         FAILED( hr = GetToken( object.get(), L"TitleToken", &tokens->titleToken, &tokens->titleNotAfter ) ) ||
++         FAILED( hr = GetToken( object.get(), L"UserToken", &tokens->userToken, &tokens->userNotAfter ) ) ||
++         FAILED( hr = MakeString( L"AuthorizationToken", &authorizationName ) ) ||
++         FAILED( hr = object->GetNamedObject( authorizationName.get(), &authorization ) ) )
++        return hr;
++    return ParseXsts( authorization.get(), &tokens->xsts );
++}
++
++HRESULT RequestXstsToken( const std::string &userToken, const ProofKey &key, const char *relyingParty,
++                          XstsToken *xsts, DWORD *httpStatus, const std::string &deviceToken,
++                          const std::string &titleToken )
++{
++    std::string body = "{\"RelyingParty\":\"" + JsonEscape( relyingParty ) + "\",\"TokenType\":\"JWT\",\"Properties\":{"
++                       "\"SandboxId\":\"RETAIL\",";
++    std::string response;
++    Ref<IJsonObject> object;
++    DWORD status = 0;
++    HRESULT hr;
++
++    if ( !deviceToken.empty() ) body += "\"DeviceToken\":\"" + JsonEscape( deviceToken ) + "\",";
++    if ( !titleToken.empty() ) body += "\"TitleToken\":\"" + JsonEscape( titleToken ) + "\",";
++    body += "\"ProofKey\":" + key.Jwk() + ",\"UserTokens\":[\"" + JsonEscape( userToken ) + "\"]}}";
++
++    hr = PostSigned( key, L"xsts.auth.xboxlive.com", L"/xsts/authorize", jsonHeaders, body, &status, &response );
++    if ( httpStatus ) *httpStatus = status;
++    if ( FAILED( hr ) ) return hr;
++    if ( status != 200 ) return Failure( "XSTS token", status, response );
++    if ( FAILED( hr = ParseObject( response, &object ) ) ) return hr;
++    return ParseXsts( object.get(), xsts );
++}
++
++static HRESULT ParseNsal( const std::string &text, Nsal *nsal )
++{
++    Ref<IJsonObject> object;
++    Ref<IJsonArray> policies, endpoints;
++    HRESULT hr;
++
++    if ( FAILED( hr = ParseObject( text, &object ) ) || FAILED( hr = GetArray( object.get(), L"EndPoints", &endpoints ) ) )
++        return hr;
++
++    /* A title's list has no policies of its own: its requests are not signed. */
++    if ( FAILED( GetArray( object.get(), L"SignaturePolicies", &policies ) ) ) policies.reset();
++    for ( UINT32 i = 0; policies.get(); ++i )
++    {
++        Ref<IJsonObject> entry;
++        SignaturePolicy policy;
++        DOUBLE version = 0, maxBodyBytes = 0;
++
++        if ( ( hr = policies->GetObjectAt( i, &entry ) ) == E_BOUNDS ) break;
++        if ( FAILED( hr ) ) return hr;
++        GetNumber( entry.get(), L"Version", &version );
++        GetNumber( entry.get(), L"MaxBodyBytes", &maxBodyBytes );
++        policy.version = (UINT32)version;
++        policy.maxBodyBytes = (UINT64)maxBodyBytes;
++        for ( const std::string &algorithm : GetStrings( entry.get(), L"SupportedAlgorithms" ) )
++            if ( algorithm == "ES256" ) policy.es256 = TRUE;
++        policy.extraHeaders = GetStrings( entry.get(), L"ExtraHeaders" );
++        nsal->policies.push_back( policy );
++    }
++
++    for ( UINT32 i = 0;; ++i )
++    {
++        Ref<IJsonObject> entry;
++        NsalEndpoint endpoint;
++        std::string hostType;
++        DOUBLE index;
++
++        if ( ( hr = endpoints->GetObjectAt( i, &entry ) ) == E_BOUNDS ) break;
++        if ( FAILED( hr ) ) return hr;
++        if ( FAILED( GetString( entry.get(), L"Protocol", &endpoint.protocol ) ) ||
++             FAILED( GetString( entry.get(), L"Host", &endpoint.host ) ) ||
++             FAILED( GetString( entry.get(), L"HostType", &hostType ) ) )
++            continue;
++        endpoint.protocol = Lower( endpoint.protocol );
++        endpoint.host = Lower( endpoint.host );
++        /* "*.example.com" matches below example.com, "*" any host. */
++        if ( hostType == "wildcard" && ( endpoint.host == "*" || endpoint.host.compare( 0, 2, "*." ) == 0 ) )
++        {
++            endpoint.wildcard = TRUE;
++            endpoint.host.erase( 0, 1 );
++        }
++        else if ( hostType != "fqdn" )
++        {
++            FIXME( "NSAL host type %s not supported.\n", hostType.c_str() );
++            continue;
++        }
++        GetString( entry.get(), L"Path", &endpoint.path );
++        GetString( entry.get(), L"RelyingParty", &endpoint.relyingParty );
++        GetString( entry.get(), L"TokenType", &endpoint.tokenType );
++        if ( SUCCEEDED( GetNumber( entry.get(), L"SignaturePolicyIndex", &index ) ) && index >= 0 &&
++             index < (DOUBLE)nsal->policies.size() )
++            endpoint.signaturePolicy = (INT32)index;
++        nsal->endpoints.push_back( std::move( endpoint ) );
++    }
++    return S_OK;
++}
++
++HRESULT RequestNsal( const std::wstring &path, const std::wstring &headers, Nsal *nsal )
++{
++    std::wstring allHeaders = L"Accept: application/json\r\nx-xbl-contract-version: 1\r\n" + headers;
++    std::string response;
++    DWORD status = 0;
++    HRESULT hr;
++
++    if ( FAILED( hr = HttpRequest( L"GET", L"title.mgt.xboxlive.com", path.c_str(), allHeaders, std::string(),
++                                   &status, &response ) ) )
++        return hr;
++    if ( status != 200 ) return Failure( "NSAL", status, response );
++    return ParseNsal( response, nsal );
++}
++
++HRESULT SignRequest( const ProofKey &key, const SignaturePolicy &policy, const char *method,
++                     const std::string &pathAndQuery, const std::string &authorization,
++                     const HttpHeaders &headers, const BYTE *body, SIZE_T bodySize, std::string *signature )
++{
++    UINT64 timestamp = Now();
++    BYTE raw[64];
++    HRESULT hr;
++
++    if ( policy.version != 1 || !policy.es256 ) return E_NOTIMPL;
++    std::string payload = SigningPayload( policy, timestamp, method, pathAndQuery, authorization, headers, body, bodySize );
++    if ( FAILED( hr = key.Sign( reinterpret_cast<const BYTE *>(payload.data()), payload.size(), raw ) ) ) return hr;
++    *signature = SignatureHeader( policy.version, timestamp, raw );
++    return S_OK;
++}
++
++}
+diff --git a/src/System/XboxLive.h b/src/System/XboxLive.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c2f31405dc79d75c5b2b07273430a83fa5ab8b6
+--- /dev/null
++++ b/src/System/XboxLive.h
+@@ -0,0 +1,117 @@
++/*
++ * Xbox Game runtime Library
++ *  Xbox Live authentication: HTTP, JSON, proof key, user and XSTS tokens, NSAL, signatures
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __XGAMERUNTIME_XBOXLIVE_H__
++#define __XGAMERUNTIME_XBOXLIVE_H__
++
++#include "../private.h"
++#include "Nsal.h"
++
++#include <bcrypt.h>
++#include <winstring.h>
++#include <string>
++
++namespace XboxLive
++{
++
++/* An HTTPS request through WinHTTP; headers are "Name: value" lines separated by CRLF. */
++HRESULT HttpRequest( const wchar_t *method, const wchar_t *host, const wchar_t *path, const std::wstring &headers,
++                     const std::string &body, DWORD *status, std::string *response );
++
++/* UTF-8 to and from UTF-16; a length of -1 converts up to the NUL. */
++std::wstring Widen( const std::string &text );
++std::string Narrow( const wchar_t *text, int length = -1 );
++std::string Narrow( HSTRING text );
++
++/* The current time as a FILETIME, in 100 ns units. */
++UINT64 Now();
++
++/* The ECDSA P-256 key that proves possession of the XSTS tokens it was bound to. */
++class ProofKey
++{
++public:
++    ProofKey() = default;
++    ProofKey( const ProofKey & ) = delete;
++    ProofKey &operator=( const ProofKey & ) = delete;
++    ~ProofKey();
++
++    HRESULT Generate();
++    /* The public key as a JSON Web Key, as XSTS requests carry it. */
++    const std::string &Jwk() const { return jwk; }
++    /* ES256: ECDSA over the SHA-256 of data, r || s. */
++    HRESULT Sign( const BYTE *data, SIZE_T size, BYTE signature[64] ) const;
++
++private:
++    BCRYPT_ALG_HANDLE algorithm = nullptr;
++    BCRYPT_KEY_HANDLE key = nullptr;
++    std::string jwk;
++};
++
++/* What an XSTS token tells about the user (DisplayClaims.xui[0]). Optional claims are empty. */
++struct XstsToken
++{
++    std::string token;
++    std::string userHash;         /* uhs */
++    UINT64 xuid = 0;              /* xid */
++    std::string gamertag;         /* gtg */
++    std::string modernGamertag;   /* mgt */
++    std::string modernSuffix;     /* mgs */
++    std::string uniqueModern;     /* umg */
++    std::string ageGroup;         /* agg: Adult, Teen, Child */
++    std::string privileges;       /* prv: space-separated privilege numbers */
++    UINT64 notAfter = 0;          /* expiry as a FILETIME */
++};
++
++/* device.auth.xboxlive.com: a device token from the device's RPS ticket, bound to the proof key. */
++HRESULT RequestDeviceToken( const std::string &deviceTicket, const ProofKey &key, std::string *deviceToken,
++                            UINT64 *notAfter );
++
++/* What SISU authorization gives a title's MSA app on a device. */
++struct SisuTokens
++{
++    std::string userToken, titleToken;
++    UINT64 userNotAfter = 0, titleNotAfter = 0;
++    XstsToken xsts; /* for http://xboxlive.com */
++};
++
++/* sisu.xboxlive.com/authorize: user, title and XSTS tokens from the user's RPS ticket for the
++ * title's MSA app id and a device token, as Win32 titles sign in. */
++HRESULT SisuAuthorize( const std::string &rpsTicket, const char *appId, const std::string &deviceToken,
++                       const ProofKey &key, SisuTokens *tokens );
++
++/* xsts.auth.xboxlive.com: an XSTS token for a relying party, bound to the proof key, with the
++ * device and title tokens. On failure, httpStatus tells the HTTP status, if there was a response. */
++HRESULT RequestXstsToken( const std::string &userToken, const ProofKey &key, const char *relyingParty,
++                          XstsToken *xsts, DWORD *httpStatus = nullptr, const std::string &deviceToken = std::string(),
++                          const std::string &titleToken = std::string() );
++
++/* title.mgt.xboxlive.com: an NSAL, with the headers the request needs (none for the default one). */
++HRESULT RequestNsal( const std::wstring &path, const std::wstring &headers, Nsal *nsal );
++
++/* The Signature header for a request under a version 1 ES256 policy, signed now with the key;
++ * E_NOTIMPL for other policies. */
++HRESULT SignRequest( const ProofKey &key, const SignaturePolicy &policy, const char *method,
++                     const std::string &pathAndQuery, const std::string &authorization,
++                     const HttpHeaders &headers, const BYTE *body, SIZE_T bodySize, std::string *signature );
++
++}
++
++#endif
+diff --git a/src/main.cpp b/src/main.cpp
+index c562535877d5b4fda2721a31841f60a65a6bf877..4130402edc591b8f9f505aac860ce9e2ea6065b6 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -138,6 +138,8 @@ HRESULT WINAPI QueryApiImpl( REFCLSID clsid, REFIID iid, void **out )
+         return x_error->QueryInterface( iid, out );
+     if ( IsEqualGUID( clsid, CLSID_XNetworkingImpl ) )
+         return x_networking->QueryInterface( iid, out );
++    if ( IsEqualGUID( clsid, CLSID_XUserImpl ) )
++        return x_user->QueryInterface( iid, out );
+ 
+     FIXME( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid( &clsid ) );
+     return E_NOINTERFACE;
+diff --git a/src/private.h b/src/private.h
+index b71f3bf1fefce32f3c8a2bf851cfca46515af57d..e1ba8d7862b4dc160dde2bed3f5fda7e0016b742 100644
+--- a/src/private.h
++++ b/src/private.h
+@@ -83,6 +83,7 @@ extern IXSystemImpl5 *x_system;
+ extern IXSystemAnalyticsImpl *x_system_analytics;
+ extern IXErrorImpl *x_error;
+ extern IXNetworkingImpl2 *x_networking;
++extern IXUserImpl6 *x_user;
+ 
+ #ifdef __cplusplus
+ /* Pass an error to the title's XErrorSetCallback() callback and options. */
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 9511cc192cb7c68bec778691f56860126ee5c9d8..9ad54259f69846bea94e12f2bbb2082c119f7ec0 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -2,9 +2,12 @@ add_executable(test_xgameruntime
+         System/test_xerror.cpp
+         System/test_xgame.cpp
+         System/test_xgameruntimefeature.cpp
++        System/test_nsal.cpp
++        ${PROJECT_SOURCE_DIR}/src/System/Nsal.cpp
+         System/test_xnetworking.cpp
+         System/test_xsystem.cpp
+         System/test_xthreading.cpp
++        System/test_xuser.cpp
+         test_fixtures.cpp)
+ 
+ # The runtime reads MicrosoftGame.config from beside the executable.
+@@ -16,6 +19,7 @@ add_custom_command(TARGET test_xgameruntime POST_BUILD
+ target_link_libraries(test_xgameruntime
+         PRIVATE
+         libxgameruntime
++        winhttp
+         GTest::gtest_main )
+ 
+ target_link_options(test_xgameruntime PRIVATE
+diff --git a/tests/System/test_nsal.cpp b/tests/System/test_nsal.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0431066671804002acbe88d9a56c1a1f50e58319
+--- /dev/null
++++ b/tests/System/test_nsal.cpp
+@@ -0,0 +1,187 @@
++/*
++ * Tests for the NSAL and request signing (src/System/Nsal.cpp, built into the tests)
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <gtest/gtest.h>
++
++#include "../../src/System/Nsal.h"
++
++using namespace XboxLive;
++
++static NsalEndpoint Endpoint( const char *protocol, const char *host, const char *path, const char *relyingParty,
++                              INT32 policy = -1 )
++{
++    NsalEndpoint endpoint;
++    endpoint.protocol = protocol;
++    endpoint.wildcard = host[0] == '*';
++    endpoint.host = endpoint.wildcard ? host + 1 : host;
++    endpoint.path = path;
++    endpoint.relyingParty = relyingParty;
++    endpoint.tokenType = "JWT";
++    endpoint.signaturePolicy = policy;
++    return endpoint;
++}
++
++/* The shape of the default NSAL (title.mgt.xboxlive.com/titles/default/endpoints?type=1). */
++static Nsal DefaultLike()
++{
++    Nsal nsal;
++    nsal.policies.resize( 2 );
++    nsal.endpoints = {
++        Endpoint( "https", "*.xboxlive.com", "", "http://xboxlive.com", 0 ),
++        Endpoint( "http", "*.xboxlive.com", "", "" ),
++        Endpoint( "https", "*.ui.xboxlive.com", "", "" ),
++        Endpoint( "https", "privileges.xboxlive.com", "/upsell", "http://upsell.example", 1 ),
++        Endpoint( "https", "playfabapi.com", "", "http://playfab.xboxlive.com/" ),
++    };
++    return nsal;
++}
++
++static std::string RelyingPartyFor( const Nsal &nsal, const char *text )
++{
++    Url url;
++    if ( !ParseUrl( text, &url ) ) return "(bad url)";
++    const NsalEndpoint *endpoint = nsal.Find( url );
++    return endpoint ? endpoint->relyingParty : "(none)";
++}
++
++TEST(NsalTests, ParsesUrls)
++{
++    Url url;
++
++    ASSERT_TRUE(ParseUrl("HTTPS://Title.MGT.xboxlive.com:443/titles/1/endpoints?type=1", &url));
++    EXPECT_EQ(url.scheme, "https");
++    EXPECT_EQ(url.host, "title.mgt.xboxlive.com");
++    EXPECT_EQ(url.pathAndQuery, "/titles/1/endpoints?type=1");
++
++    ASSERT_TRUE(ParseUrl("https://playfabapi.com", &url));
++    EXPECT_EQ(url.pathAndQuery, "/");
++    ASSERT_TRUE(ParseUrl("https://user:secret@example.com?q=1", &url));
++    EXPECT_EQ(url.host, "example.com");
++    EXPECT_EQ(url.pathAndQuery, "/?q=1");
++
++    EXPECT_FALSE(ParseUrl("example.com/?u=http://example.org", &url));
++    EXPECT_FALSE(ParseUrl("https:///path", &url));
++    EXPECT_FALSE(ParseUrl(nullptr, &url));
++}
++
++TEST(NsalTests, FindsTheMostSpecificEndpoint)
++{
++    Nsal nsal = DefaultLike();
++
++    EXPECT_EQ(RelyingPartyFor(nsal, "https://profile.xboxlive.com/users/me"), "http://xboxlive.com");
++    EXPECT_EQ(RelyingPartyFor(nsal, "https://a.b.xboxlive.com/"), "http://xboxlive.com");
++    EXPECT_EQ(RelyingPartyFor(nsal, "https://PRIVILEGES.xboxlive.com/upsell?x=1"), "http://upsell.example");
++    EXPECT_EQ(RelyingPartyFor(nsal, "https://privileges.xboxlive.com/upsell/more"), "http://upsell.example");
++    EXPECT_EQ(RelyingPartyFor(nsal, "https://privileges.xboxlive.com/upsells"), "http://xboxlive.com");
++    EXPECT_EQ(RelyingPartyFor(nsal, "https://playfabapi.com/"), "http://playfab.xboxlive.com/");
++}
++
++TEST(NsalTests, WebSocketsMatchTheirHttpProtocol)
++{
++    Nsal nsal = DefaultLike();
++
++    // XSAPI's real-time activity service.
++    EXPECT_EQ(RelyingPartyFor(nsal, "wss://rta.xboxlive.com/connect"), "http://xboxlive.com");
++    EXPECT_EQ(RelyingPartyFor(nsal, "ws://rta.xboxlive.com/connect"), "");
++}
++
++TEST(NsalTests, GivesNoTokenOutsideTheList)
++{
++    Nsal nsal = DefaultLike();
++
++    // Entries without a relying party exclude what they match.
++    EXPECT_EQ(RelyingPartyFor(nsal, "http://profile.xboxlive.com/users/me"), "");
++    EXPECT_EQ(RelyingPartyFor(nsal, "https://help.ui.xboxlive.com/"), "");
++    // Hosts the list does not name.
++    EXPECT_EQ(RelyingPartyFor(nsal, "https://xboxlive.com/"), "(none)");
++    EXPECT_EQ(RelyingPartyFor(nsal, "https://xboxlive.com.example.org/"), "(none)");
++    EXPECT_EQ(RelyingPartyFor(nsal, "https://20ca2.playfabapi.com/"), "(none)");
++    EXPECT_EQ(RelyingPartyFor(nsal, "https://example.com/"), "(none)");
++}
++
++TEST(NsalTests, CatchAllExcludesOnlyWhatNothingElseMatches)
++{
++    Nsal title, defaults = DefaultLike();
++
++    // A title's list ends with "https://*" and "http://*", without a relying party.
++    title.endpoints = { Endpoint( "https", "multiplayer.example.net", "", "https://multiplayer.example.net/" ),
++                        Endpoint( "https", "*", "", "" ), Endpoint( "http", "*", "", "" ) };
++    title.Append( defaults );
++
++    EXPECT_EQ(RelyingPartyFor(title, "https://multiplayer.example.net/session"), "https://multiplayer.example.net/");
++    EXPECT_EQ(RelyingPartyFor(title, "https://profile.xboxlive.com/users/me"), "http://xboxlive.com");
++    EXPECT_EQ(RelyingPartyFor(title, "https://example.com/"), "");
++}
++
++TEST(NsalTests, AppendedEntriesComeSecondAndKeepTheirPolicies)
++{
++    Nsal title, defaults = DefaultLike();
++    Url url;
++
++    title.policies.resize( 1 );
++    title.policies[0].version = 7;
++    title.endpoints = { Endpoint( "https", "*.xboxlive.com", "", "rp://title/", 0 ) };
++    title.Append( defaults );
++
++    ASSERT_EQ(title.policies.size(), 3u);
++    EXPECT_EQ(RelyingPartyFor(title, "https://profile.xboxlive.com/"), "rp://title/");
++    ASSERT_TRUE(ParseUrl("https://privileges.xboxlive.com/upsell", &url));
++    const NsalEndpoint *endpoint = title.Find( url );
++    ASSERT_NE(endpoint, nullptr);
++    EXPECT_EQ(endpoint->signaturePolicy, 2); // its policy 1, after the title's one
++    EXPECT_EQ(title.policies[0].version, 7u);
++}
++
++TEST(NsalTests, SignsTheDocumentedBytes)
++{
++    SignaturePolicy policy;
++    HttpHeaders headers = { { "x-extra", "v" } };
++    const BYTE body[] = "0123456789";
++
++    policy.version = 1;
++    policy.maxBodyBytes = 8;
++    policy.extraHeaders = { "X-Extra", "Missing" };
++    std::string payload = SigningPayload( policy, 0x0102030405060708ull, "post", "/p?q=1", "XBL3.0 x=h;t", headers,
++                                          body, 10 );
++
++    std::string expected( "\x00\x00\x00\x01\x00" "\x01\x02\x03\x04\x05\x06\x07\x08\x00" "POST\x00" "/p?q=1\x00"
++                          "XBL3.0 x=h;t\x00" "v\x00" "\x00" "01234567\x00", 5 + 9 + 5 + 7 + 13 + 2 + 1 + 9 );
++    EXPECT_EQ(payload, expected);
++
++    // No extra headers and no body: the body's NUL is still there.
++    policy.extraHeaders.clear();
++    payload = SigningPayload( policy, 0, "GET", "/", "a", headers, nullptr, 0 );
++    EXPECT_EQ(payload, std::string( "\x00\x00\x00\x01\x00" "\x00\x00\x00\x00\x00\x00\x00\x00\x00" "GET\x00" "/\x00" "a\x00" "\x00",
++                                    5 + 9 + 4 + 2 + 2 + 1 ));
++}
++
++TEST(NsalTests, EncodesTheSignatureHeader)
++{
++    BYTE signature[64] = {};
++
++    std::string header = SignatureHeader( 1, 0, signature );
++    EXPECT_EQ(header.size(), 104u);              // 76 bytes
++    EXPECT_EQ(header.substr( 0, 6 ), "AAAAAQ"); // version 1, big-endian
++
++    EXPECT_EQ(Base64( reinterpret_cast<const BYTE *>("f"), 1 ), "Zg==");
++    EXPECT_EQ(Base64( reinterpret_cast<const BYTE *>("fo"), 2 ), "Zm8=");
++    EXPECT_EQ(Base64( reinterpret_cast<const BYTE *>("foo"), 3 ), "Zm9v");
++    EXPECT_EQ(Base64( reinterpret_cast<const BYTE *>("\xfb\xff"), 2 ), "+/8=");
++}
+diff --git a/tests/System/test_xuser.cpp b/tests/System/test_xuser.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..13540e2d9efc94060d35d1942676a20e6d705071
+--- /dev/null
++++ b/tests/System/test_xuser.cpp
+@@ -0,0 +1,347 @@
++/*
++ * Tests for XUser
++ *
++ * XUserTests run anywhere. XUserNoAccountTests run only with XGR_XODUS_NO_ACCOUNT=1 and an Xodus
++ * service with no signed-in account (XODUS_SOCKET). XUserLiveTests sign in for real and run only
++ * with XGR_LIVE_XBOX=1, an Xodus service with a signed-in account and the title's own
++ * MicrosoftGame.config beside the executable (its MSA app id). They print no personal data.
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include "../test_fixtures.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <windows.h>
++#include <winhttp.h>
++#include <xasync.h>
++#include <xgame.h>
++#include <xgameerr.h>
++#include <xuser.h>
++
++class XUserTests : public XGameRuntimeTests
++{
++};
++
++TEST_F(XUserTests, OneUserAtATime)
++{
++    UINT32 maxUsers = 0;
++
++    EXPECT_HRESULT_SUCCEEDED(XUserGetMaxUsers(&maxUsers));
++    EXPECT_EQ(maxUsers, 1u);
++}
++
++TEST_F(XUserTests, ArgumentsAreChecked)
++{
++    UINT64 id;
++    XUserHandle handle = nullptr;
++
++    EXPECT_EQ(XUserGetId(nullptr, &id), E_INVALIDARG);
++    EXPECT_EQ(XUserDuplicateHandle(nullptr, &handle), E_INVALIDARG);
++    EXPECT_EQ(XUserAddAsync(XUserAddOptions::AddDefaultUserSilently, nullptr), E_POINTER);
++    EXPECT_EQ(XUserGetMaxUsers(nullptr), E_POINTER);
++}
++
++class XUserNoAccountTests : public XGameRuntimeTests
++{
++protected:
++    void SetUp() override
++    {
++        const char *noAccount = getenv("XGR_XODUS_NO_ACCOUNT");
++        if (!noAccount || strcmp(noAccount, "1")) GTEST_SKIP() << "set XGR_XODUS_NO_ACCOUNT=1 with a service that has no account";
++    }
++};
++
++TEST_F(XUserNoAccountTests, NoDefaultUserWithoutAnAccount)
++{
++    XAsyncBlock block{};
++    XUserHandle user = nullptr;
++
++    // The service answers with an empty message: no ticket, so no user.
++    ASSERT_HRESULT_SUCCEEDED(XUserAddAsync(XUserAddOptions::AddDefaultUserSilently, &block));
++    EXPECT_EQ(XAsyncGetStatus(&block, TRUE), E_GAMEUSER_NO_DEFAULT_USER);
++    EXPECT_EQ(XUserAddResult(&block, &user), E_GAMEUSER_NO_DEFAULT_USER);
++    EXPECT_EQ(user, nullptr);
++}
++
++class XUserLiveTests : public XGameRuntimeTests
++{
++protected:
++    void SetUp() override
++    {
++        const char *live = getenv("XGR_LIVE_XBOX");
++        if (!live || strcmp(live, "1")) GTEST_SKIP() << "set XGR_LIVE_XBOX=1 to sign in for real";
++    }
++
++    static XUserHandle Add()
++    {
++        XAsyncBlock block{};
++        XUserHandle user = nullptr;
++
++        EXPECT_HRESULT_SUCCEEDED(XUserAddAsync(XUserAddOptions::AddDefaultUserSilently, &block));
++        EXPECT_HRESULT_SUCCEEDED(XAsyncGetStatus(&block, TRUE));
++        EXPECT_HRESULT_SUCCEEDED(XUserAddResult(&block, &user));
++        return user;
++    }
++};
++
++TEST_F(XUserLiveTests, SignsInSilentlyThroughXodus)
++{
++    XUserHandle user = Add(), again, found = nullptr, duplicate = nullptr;
++    char gamertag[16], modern[97], unique[101];
++    XUserAgeGroup ageGroup = XUserAgeGroup::Unknown;
++    XUserPrivilegeDenyReason reason;
++    XUserLocalId localId{};
++    BOOLEAN multiplayer = FALSE, guest = TRUE;
++    XUserState state;
++    UINT64 xuid = 0;
++
++    ASSERT_NE(user, nullptr);
++    EXPECT_HRESULT_SUCCEEDED(XUserGetId(user, &xuid));
++    EXPECT_NE(xuid, 0u);
++    EXPECT_HRESULT_SUCCEEDED(XUserGetGamertag(user, XUserGamertagComponent::Classic, sizeof(gamertag), gamertag, nullptr));
++    EXPECT_GT(strlen(gamertag), 0u);
++    EXPECT_HRESULT_SUCCEEDED(XUserGetGamertag(user, XUserGamertagComponent::Modern, sizeof(modern), modern, nullptr));
++    EXPECT_HRESULT_SUCCEEDED(XUserGetGamertag(user, XUserGamertagComponent::UniqueModern, sizeof(unique), unique, nullptr));
++    EXPECT_HRESULT_SUCCEEDED(XUserGetAgeGroup(user, &ageGroup));
++    EXPECT_HRESULT_SUCCEEDED(XUserGetIsGuest(user, &guest));
++    EXPECT_FALSE(guest);
++    EXPECT_HRESULT_SUCCEEDED(XUserGetState(user, &state));
++    EXPECT_EQ(state, XUserState::SignedIn);
++    EXPECT_HRESULT_SUCCEEDED(XUserCheckPrivilege(user, XUserPrivilegeOptions::None, XUserPrivilege::Multiplayer, &multiplayer, &reason));
++    EXPECT_HRESULT_SUCCEEDED(XUserGetLocalId(user, &localId));
++    std::printf("[   LIVE   ] signed in: xuid set, gamertag %zu chars, unique modern gamertag %zu chars, age group %u, "
++                "multiplayer privilege %d\n", strlen(gamertag), strlen(unique), (unsigned)ageGroup, multiplayer);
++
++    // The same user is found again, by id and by local id, and added again.
++    EXPECT_HRESULT_SUCCEEDED(XUserFindUserById(xuid, &found));
++    EXPECT_EQ(XUserCompare(user, found), 0);
++    XUserCloseHandle(found);
++    EXPECT_HRESULT_SUCCEEDED(XUserFindUserByLocalId(localId, &found));
++    EXPECT_EQ(XUserCompare(user, found), 0);
++    XUserCloseHandle(found);
++    again = Add();
++    EXPECT_EQ(XUserCompare(user, again), 0);
++    XUserCloseHandle(again);
++    EXPECT_EQ(XUserFindUserById(xuid + 1, &found), E_GAMEUSER_USER_NOT_FOUND);
++
++    EXPECT_HRESULT_SUCCEEDED(XUserDuplicateHandle(user, &duplicate));
++    XUserCloseHandle(duplicate);
++    XUserCloseHandle(user);
++}
++
++/* A token request's outcome. Tests compare tokens, and print only their lengths. */
++struct TokenResult
++{
++    HRESULT hr = E_FAIL;
++    std::string token, signature;
++    bool signatureNull = true;
++    SIZE_T tokenSize = 0, signatureSize = 0;
++};
++
++static TokenResult GetToken( XUserHandle user, const char *method, const char *url,
++                             XUserGetTokenAndSignatureOptions options = XUserGetTokenAndSignatureOptions::None )
++{
++    XUserGetTokenAndSignatureData *data = nullptr;
++    XAsyncBlock block{};
++    TokenResult result;
++    SIZE_T size = 0;
++
++    if ( FAILED( result.hr = XUserGetTokenAndSignatureAsync( user, options, method, url, 0, nullptr, 0, nullptr, &block ) ) ||
++         FAILED( result.hr = XAsyncGetStatus( &block, TRUE ) ) ||
++         FAILED( result.hr = XUserGetTokenAndSignatureResultSize( &block, &size ) ) )
++        return result;
++    std::vector<char> buffer( size );
++    if ( FAILED( result.hr = XUserGetTokenAndSignatureResult( &block, size, buffer.data(), &data, nullptr ) ) ) return result;
++    result.token = data->token;
++    result.tokenSize = data->tokenSize;
++    result.signatureNull = !data->signature;
++    if ( data->signature ) result.signature = data->signature;
++    result.signatureSize = data->signatureSize;
++    return result;
++}
++
++static TokenResult GetTokenUtf16( XUserHandle user, const WCHAR *method, const WCHAR *url )
++{
++    XUserGetTokenAndSignatureUtf16Data *data = nullptr;
++    XAsyncBlock block{};
++    TokenResult result;
++    SIZE_T size = 0;
++
++    if ( FAILED( result.hr = XUserGetTokenAndSignatureUtf16Async( user, XUserGetTokenAndSignatureOptions::None, method, url,
++                                                                  0, nullptr, 0, nullptr, &block ) ) ||
++         FAILED( result.hr = XAsyncGetStatus( &block, TRUE ) ) ||
++         FAILED( result.hr = XUserGetTokenAndSignatureUtf16ResultSize( &block, &size ) ) )
++        return result;
++    std::vector<char> buffer( size );
++    if ( FAILED( result.hr = XUserGetTokenAndSignatureUtf16Result( &block, size, buffer.data(), &data, nullptr ) ) )
++        return result;
++    for ( const WCHAR *c = data->token; *c; ++c ) result.token += (char)*c;
++    result.tokenSize = data->tokenCount;
++    result.signatureNull = !data->signature;
++    for ( const WCHAR *c = data->signature; c && *c; ++c ) result.signature += (char)*c;
++    result.signatureSize = data->signatureCount;
++    return result;
++}
++
++/* An HTTPS GET made by the test itself; only the status comes back. */
++static DWORD HttpsGet( const wchar_t *host, const wchar_t *path, const std::string &headers )
++{
++    std::wstring wideHeaders( headers.begin(), headers.end() );
++    DWORD status = 0, size = sizeof(status);
++    HINTERNET session, connection = nullptr, request = nullptr;
++
++    if ( ( session = WinHttpOpen( L"xgameruntime-tests", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
++                                  WINHTTP_NO_PROXY_BYPASS, 0 ) ) &&
++         ( connection = WinHttpConnect( session, host, INTERNET_DEFAULT_HTTPS_PORT, 0 ) ) &&
++         ( request = WinHttpOpenRequest( connection, L"GET", path, nullptr, WINHTTP_NO_REFERER,
++                                         WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE ) ) &&
++         WinHttpSendRequest( request, wideHeaders.c_str(), (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0 ) &&
++         WinHttpReceiveResponse( request, nullptr ) )
++        WinHttpQueryHeaders( request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
++                             &status, &size, WINHTTP_NO_HEADER_INDEX );
++    if ( request ) WinHttpCloseHandle( request );
++    if ( connection ) WinHttpCloseHandle( connection );
++    if ( session ) WinHttpCloseHandle( session );
++    return status;
++}
++
++TEST_F(XUserLiveTests, GivesSignedTokensForXboxLive)
++{
++    XUserHandle user = Add();
++    ASSERT_NE(user, nullptr);
++
++    TokenResult result = GetToken( user, "GET", "https://profile.xboxlive.com/users/me/profile/settings?settings=Gamertag" );
++    ASSERT_HRESULT_SUCCEEDED(result.hr);
++    EXPECT_EQ(result.token.compare( 0, 9, "XBL3.0 x=" ), 0);
++    EXPECT_EQ(result.tokenSize, result.token.size() + 1);
++    ASSERT_FALSE(result.signatureNull);
++    EXPECT_EQ(result.signature.size(), 104u);
++    EXPECT_EQ(result.signature.substr( 0, 6 ), "AAAAAQ"); // policy version 1
++    EXPECT_EQ(result.signatureSize, 105u);
++
++    DWORD status = HttpsGet( L"profile.xboxlive.com", L"/users/me/profile/settings?settings=Gamertag",
++                             "x-xbl-contract-version: 2\r\nAuthorization: " + result.token + "\r\nSignature: " +
++                             result.signature + "\r\n" );
++    std::printf("[   LIVE   ] profile.xboxlive.com: HTTP %lu; token %zu chars\n", status, result.token.size());
++    EXPECT_EQ(status, 200u);
++    XUserCloseHandle(user);
++}
++
++TEST_F(XUserLiveTests, GivesTokensOnlyWhereTheNsalSays)
++{
++    XUserHandle user = Add();
++    ASSERT_NE(user, nullptr);
++
++    // Hosts outside the NSAL, and plain HTTP, get no token at all.
++    EXPECT_EQ(GetToken( user, "GET", "https://example.com/" ).hr, E_GAMEUSER_NO_TOKEN_REQUIRED);
++    EXPECT_EQ(GetToken( user, "GET", "http://profile.xboxlive.com/users/me/profile/settings" ).hr,
++              E_GAMEUSER_NO_TOKEN_REQUIRED);
++
++    // Tokens come from a cache, per relying party; ForceRefresh asks for a new one.
++    TokenResult first = GetToken( user, "GET", "https://userpresence.xboxlive.com/users/me" );
++    TokenResult again = GetToken( user, "POST", "https://social.xboxlive.com/users/me/people" );
++    TokenResult forced = GetToken( user, "GET", "https://userpresence.xboxlive.com/users/me",
++                                   XUserGetTokenAndSignatureOptions::ForceRefresh );
++    ASSERT_HRESULT_SUCCEEDED(first.hr);
++    ASSERT_HRESULT_SUCCEEDED(again.hr);
++    ASSERT_HRESULT_SUCCEEDED(forced.hr);
++    EXPECT_EQ(first.token, again.token);
++
++    // PlayFab: another relying party, and requests that are not signed.
++    TokenResult playfab = GetToken( user, "POST", "https://playfabapi.com/" );
++    ASSERT_HRESULT_SUCCEEDED(playfab.hr);
++    EXPECT_NE(playfab.token, first.token);
++    EXPECT_TRUE(playfab.signatureNull);
++    EXPECT_EQ(playfab.signatureSize, 0u);
++    std::printf("[   LIVE   ] tokens: xboxlive.com %zu chars (forced refresh %s), playfab %zu chars, unsigned\n",
++                first.token.size(), forced.token == first.token ? "same token" : "new token", playfab.token.size());
++    XUserCloseHandle(user);
++}
++
++TEST_F(XUserLiveTests, Utf16ResultsMatch)
++{
++    XUserHandle user = Add();
++    ASSERT_NE(user, nullptr);
++
++    TokenResult narrow = GetToken( user, "GET", "https://userpresence.xboxlive.com/users/me" );
++    TokenResult wide = GetTokenUtf16( user, L"GET", L"https://userpresence.xboxlive.com/users/me" );
++    ASSERT_HRESULT_SUCCEEDED(narrow.hr);
++    ASSERT_HRESULT_SUCCEEDED(wide.hr);
++    EXPECT_EQ(wide.token, narrow.token);
++    EXPECT_EQ(wide.tokenSize, wide.token.size() + 1);
++    EXPECT_EQ(wide.signature.size(), 104u);
++    EXPECT_EQ(wide.signatureSize, 105u);
++    XUserCloseHandle(user);
++}
++
++/* The title's NSAL answers a token with title claims only, which come from SISU sign-in, whose
++ * device.auth.xboxlive.com step refuses a request whose signature is wrong (HTTP 403): a 200
++ * here means that sign-in and signatures work end to end. */
++TEST_F(XUserLiveTests, TitleNsalAnswersTheSignedInTitle)
++{
++    UINT32 titleId = 0;
++    XUserHandle user = Add();
++    ASSERT_NE(user, nullptr);
++    ASSERT_HRESULT_SUCCEEDED(XGameGetXboxTitleId( &titleId ));
++
++    std::string path = "/titles/" + std::to_string( titleId ) + "/endpoints";
++    std::wstring widePath( path.begin(), path.end() );
++    TokenResult result = GetToken( user, "GET", ( "https://title.mgt.xboxlive.com" + path ).c_str() );
++    ASSERT_HRESULT_SUCCEEDED(result.hr);
++    ASSERT_FALSE(result.signatureNull);
++
++    DWORD status = HttpsGet( L"title.mgt.xboxlive.com", widePath.c_str(), "x-xbl-contract-version: 1\r\nAuthorization: " +
++                             result.token + "\r\nSignature: " + result.signature + "\r\n" );
++    std::printf("[   LIVE   ] title.mgt.xboxlive.com: the title's NSAL, HTTP %lu\n", status);
++    EXPECT_EQ(status, 200u);
++    XUserCloseHandle(user);
++}
++
++/* Minecraft's own services are in its title's NSAL, each with its relying party. */
++TEST_F(XUserLiveTests, MinecraftServicesGetTheirOwnTokens)
++{
++    UINT32 titleId = 0;
++    ASSERT_HRESULT_SUCCEEDED(XGameGetXboxTitleId( &titleId ));
++    if ( titleId != 0x35760C07 ) GTEST_SKIP() << "not Minecraft's MicrosoftGame.config";
++    XUserHandle user = Add();
++    ASSERT_NE(user, nullptr);
++
++    TokenResult xboxLive = GetToken( user, "GET", "https://userpresence.xboxlive.com/users/me" );
++    TokenResult realms = GetToken( user, "GET", "https://pocket.realms.minecraft.net/worlds" );
++    TokenResult multiplayer = GetToken( user, "POST", "https://multiplayer.minecraft.net/authentication" );
++    ASSERT_HRESULT_SUCCEEDED(xboxLive.hr);
++    ASSERT_HRESULT_SUCCEEDED(realms.hr);
++    ASSERT_HRESULT_SUCCEEDED(multiplayer.hr);
++    EXPECT_NE(realms.token, xboxLive.token);
++    EXPECT_NE(multiplayer.token, xboxLive.token);
++    EXPECT_TRUE(realms.signatureNull);
++
++    // Realms accepts a token for its relying party only.
++    std::string headers = "Client-Version: 1.21.0\r\nUser-Agent: MCPE/UWP\r\nAuthorization: ";
++    DWORD realmsStatus = HttpsGet( L"pocket.realms.minecraft.net", L"/worlds", headers + realms.token + "\r\n" );
++    DWORD wrongStatus = HttpsGet( L"pocket.realms.minecraft.net", L"/worlds", headers + xboxLive.token + "\r\n" );
++    std::printf("[   LIVE   ] pocket.realms.minecraft.net/worlds: HTTP %lu with its token, %lu with an xboxlive.com one\n",
++                realmsStatus, wrongStatus);
++    EXPECT_EQ(realmsStatus, 200u);
++    EXPECT_EQ(wrongStatus, 401u);
++    XUserCloseHandle(user);
++}

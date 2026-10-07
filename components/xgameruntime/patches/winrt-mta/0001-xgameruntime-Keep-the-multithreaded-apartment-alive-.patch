@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 23:26:41 +0200
+Subject: [PATCH] xgameruntime: Keep the multithreaded apartment alive from
+ initialization.
+
+The runtime's own threads (task queue workers, the Xodus socket thread) activate WinRT classes
+such as Windows.Storage.Streams.Buffer without initializing COM. With no thread of the process in
+the multithreaded apartment, RoGetActivationFactory() fails there with CO_E_NOTINITIALIZED. Call
+CoIncrementMTAUsage() once from InitializeApiImplEx2(), as Windows components do, so that those
+threads use the MTA implicitly.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: winrt-mta
+---
+ src/main.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/main.cpp b/src/main.cpp
+index 20b8d3cc0e9f66edec201b2695761d8a40ba1af1..84f40f462ecaaf03893556189e9d0d6e918c482a 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -55,12 +55,18 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
+     return TRUE;
+ }
+ 
++static CO_MTA_USAGE_COOKIE mtaCookie;
++
+ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, char mode, const INITIALIZE_OPTIONS *options )
+ {
+     HRESULT status = S_OK;
+ 
+     TRACE( "gdkVer %ld, gsVer %ld, mode %d, options %p.\n", gdkVer, gsVer, mode, options );
+ 
++    /* The runtime's threads use WinRT without initializing COM: keep the MTA alive for them. */
++    if ( !mtaCookie && FAILED( status = CoIncrementMTAUsage( &mtaCookie ) ) )
++        ERR( "CoIncrementMTAUsage failed, hr %#lx.\n", status );
++
+     if ( !socketInitialized )
+     {
+         if ( SUCCEEDED( status = xodus_ipclayer->InitializeSocket() ) )

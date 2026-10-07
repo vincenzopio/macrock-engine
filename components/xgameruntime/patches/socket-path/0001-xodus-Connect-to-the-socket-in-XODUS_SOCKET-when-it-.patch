@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 00:08:55 +0200
+Subject: [PATCH] xodus: Connect to the socket in XODUS_SOCKET when it is set.
+
+XODUS_SOCKET gives the host path of the Xodus service's socket, the variable the service reads,
+so that each game session can talk to its own service; without it the socket stays
+/tmp/xodus.sock on macOS ($XDG_RUNTIME_DIR/xodus.sock on Linux). A path that does not fit in
+sun_path is refused instead of truncated. NormalizeUnixPathToWine() also allocated two bytes
+fewer than it wrote ("Z:" and the NUL).
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: socket-path
+---
+ src/Xodus/IPCLayer.cpp | 73 ++++++++++++++++++++++++------------------
+ 1 file changed, 41 insertions(+), 32 deletions(-)
+
+diff --git a/src/Xodus/IPCLayer.cpp b/src/Xodus/IPCLayer.cpp
+index 6d0f62af955dffc6dca02bcd86ea93a47466d6d2..3e0f7d9a31b95d92feeace53d53b26405d85e2db 100644
+--- a/src/Xodus/IPCLayer.cpp
++++ b/src/Xodus/IPCLayer.cpp
+@@ -53,7 +53,8 @@ LPSTR NormalizeUnixPathToWine( LPCSTR unix_path )
+ 
+     len = lstrlenA( unix_path );
+ 
+-    wine_path = (LPSTR)CoTaskMemAlloc( len + 1 );
++    /* "Z:", the path and the terminating NUL. */
++    wine_path = (LPSTR)CoTaskMemAlloc( len + 3 );
+     if ( !wine_path )
+         return NULL;
+ 
+@@ -230,50 +231,58 @@ private:
+         WSADATA wsa;
+         struct sockaddr_un addr{};
+         LPSTR normalized;
+-        CHAR runtime[MAX_ENV_BUFFER];
++        CHAR runtime[MAX_ENV_BUFFER], configured[MAX_ENV_BUFFER], socket_path[MAX_ENV_BUFFER + 64];
+ 
+         TRACE( "socket_suffix %s\n", socket_suffix );
+ 
+-        switch ( xgameruntime_get_os() )
++        /* XODUS_SOCKET, when set, is the host path of the service socket (one service per game
++         * session); the socket is reached through Wine's Z: drive. */
++        if ( SUCCEEDED( xgameruntime_get_env( "XODUS_SOCKET", configured, sizeof( configured ) ) ) && configured[0] )
+         {
+-            case RunningOS::OS_Linux:
+-                if ( FAILED( xgameruntime_get_env( "XDG_RUNTIME_DIR", runtime, sizeof( runtime ) ) ) )
+-                    throw Exception( E_NOT_VALID_STATE, "Detected running under Wine on Linux, but XDG_RUNTIME_DIR was not defined!" );
+-                normalized = NormalizeUnixPathToWine( runtime );
+-                lstrcpyA( runtime, normalized );
+-                CoTaskMemFree( normalized );
+-                break;
++            if ( !( normalized = NormalizeUnixPathToWine( configured ) ) )
++            {
++                WARN( "XODUS_SOCKET is not an absolute path: %s\n", configured );
++                return STATUS_OBJECT_PATH_INVALID;
++            }
++            lstrcpynA( socket_path, normalized, sizeof( socket_path ) );
++            CoTaskMemFree( normalized );
++        }
++        else
++        {
++            switch ( xgameruntime_get_os() )
++            {
++                case RunningOS::OS_Linux:
++                    if ( FAILED( xgameruntime_get_env( "XDG_RUNTIME_DIR", runtime, sizeof( runtime ) ) ) )
++                        throw Exception( E_NOT_VALID_STATE, "Detected running under Wine on Linux, but XDG_RUNTIME_DIR was not defined!" );
++                    break;
+ 
+-            case RunningOS::OS_Windows:
+-                throw Exception( E_NOTIMPL, "Windows support is not implemented!" );
+-                break;
++                case RunningOS::OS_Windows:
++                    throw Exception( E_NOTIMPL, "Windows support is not implemented!" );
++                    break;
+ 
+-            case RunningOS::OS_Darwin:
+-                lstrcpyA( runtime, "/tmp" );
+-                normalized = NormalizeUnixPathToWine( runtime );
+-                lstrcpyA( runtime, normalized );
+-                CoTaskMemFree( normalized );
+-                break;
++                case RunningOS::OS_Darwin:
++                    lstrcpyA( runtime, "/tmp" );
++                    break;
+ 
+-            case RunningOS::OS_Other:
+-                throw Exception( E_NOTIMPL, "OS or compatibility layer is not supported!" );
++                case RunningOS::OS_Other:
++                    throw Exception( E_NOTIMPL, "OS or compatibility layer is not supported!" );
++            }
++            if ( !( normalized = NormalizeUnixPathToWine( runtime ) ) ) return STATUS_OBJECT_PATH_INVALID;
++            snprintf( socket_path, sizeof( socket_path ), "%s\\%s", normalized, socket_suffix );
++            CoTaskMemFree( normalized );
+         }
+ 
+-        WSAStartup( MAKEWORD( 2, 2 ), &wsa );
+-
+-        /* runtime, the separator, socket_suffix and the terminating NUL. */
+-        size_t len = strlen( runtime ) + strlen( socket_suffix ) + 2;
+-        LPSTR socket_path = (LPSTR)malloc( len );
+-
+-        if ( !socket_path )
+-            return STATUS_NO_MEMORY;
++        if ( strlen( socket_path ) >= sizeof( addr.sun_path ) )
++        {
++            WARN( "socket path too long for sun_path: %s\n", socket_path );
++            return STATUS_NAME_TOO_LONG;
++        }
+ 
+-        snprintf( socket_path, len, "%s\\%s", runtime, socket_suffix );
++        WSAStartup( MAKEWORD( 2, 2 ), &wsa );
+ 
+         memset( &addr, 0, sizeof(addr) );
+         addr.sun_family = AF_UNIX;
+-        lstrcpynA( addr.sun_path, socket_path, sizeof(addr.sun_path) - 1 );
+-        free( socket_path );
++        lstrcpynA( addr.sun_path, socket_path, sizeof(addr.sun_path) );
+ 
+         sockfd = socket( AF_UNIX, SOCK_STREAM, 0 );
+         if ( sockfd == INVALID_SOCKET )

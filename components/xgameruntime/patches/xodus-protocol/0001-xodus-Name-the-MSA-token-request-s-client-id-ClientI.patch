@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 00:47:23 +0200
+Subject: [PATCH] xodus: Name the MSA token request's client id ClientId.
+
+xodus-service reads MSATokenRequest with PascalCase field names (ClientId, AllowUi,
+MsaFullTrust) and rejected every request with "missing field ClientId".
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: xodus-protocol
+---
+ src/Xodus/XodusXMLBuilder.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/Xodus/XodusXMLBuilder.cpp b/src/Xodus/XodusXMLBuilder.cpp
+index 89f9fee12c7f1f8b219b201681ef1676a3baf860..0e4a847c9755addf155ad45cd080737f66453000 100644
+--- a/src/Xodus/XodusXMLBuilder.cpp
++++ b/src/Xodus/XodusXMLBuilder.cpp
+@@ -139,7 +139,7 @@ public:
+ 
+         root = xmlNewNode( nullptr, BAD_CAST "MsaTokenRequest" );
+         xmlDocSetRootElement(doc, root);
+-        xmlNewChild( root, nullptr, BAD_CAST "clientId", BAD_CAST clientIdStr );
++        xmlNewChild( root, nullptr, BAD_CAST "ClientId", BAD_CAST clientIdStr );
+         CoTaskMemFree( clientIdStr );
+         xmlNewChild( root, nullptr, BAD_CAST "AllowUi", BAD_CAST (allowUI ? "true" : "false") );
+         xmlNewChild( root, nullptr, BAD_CAST "MsaFullTrust", BAD_CAST (fullTrust ? "true" : "false") );

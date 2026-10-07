@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 21:06:54 +0200
+Subject: [PATCH] winemac.drv: Add an optional frame pacing log.
+
+With MACROCK_FPS_LOG=<path>, the drawables D3DMetal acquires (one per presented frame) are
+counted, and one line per second is appended: fps, average and worst frame time, and the
+frames slower than 33.3 ms.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: fps-log
+---
+ dlls/winemac.drv/d3dmetal_objc.m | 49 ++++++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
+diff --git a/dlls/winemac.drv/d3dmetal_objc.m b/dlls/winemac.drv/d3dmetal_objc.m
+index 9b4a054ff1aa192eaa3392bb9e566c469896dba1..eb7e2113046e651ff142c9b3a113f4a8ba4ca41b 100644
+--- a/dlls/winemac.drv/d3dmetal_objc.m
++++ b/dlls/winemac.drv/d3dmetal_objc.m
+@@ -25,6 +25,10 @@
+ #import <AppKit/AppKit.h>
+ #import <QuartzCore/QuartzCore.h>
+ #import <objc/runtime.h>
++#include <mach/mach_time.h>
++#include <os/lock.h>
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ #include "macdrv_cocoa.h"
+ #import "cocoa_app.h"
+@@ -35,6 +39,50 @@
+ #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+ 
+ 
++/* With MACROCK_FPS_LOG=<path>, append one line per second of presented frames:
++ * "<unix time> fps=<n> avg_ms=<x> max_ms=<x> slow=<frames over 33.3 ms>". */
++static void fps_log_frame(void)
++{
++    static dispatch_once_t once;
++    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
++    static FILE *file;
++    static mach_timebase_info_data_t timebase;
++    static uint64_t window_start, last, frames, slow;
++    static double max_ms;
++    uint64_t now = mach_absolute_time();
++
++    dispatch_once(&once, ^{
++        const char *path = getenv("MACROCK_FPS_LOG");
++        if (path && *path && (file = fopen(path, "a")))
++        {
++            setvbuf(file, NULL, _IOLBF, 0);
++            mach_timebase_info(&timebase);
++        }
++    });
++    if (!file) return;
++
++    os_unfair_lock_lock(&lock);
++    if (last)
++    {
++        double ms = (double)(now - last) * timebase.numer / timebase.denom / 1e6;
++        double window_ms = (double)(now - window_start) * timebase.numer / timebase.denom / 1e6;
++        frames++;
++        if (ms > max_ms) max_ms = ms;
++        if (ms > 1000.0 / 30) slow++;
++        if (window_ms >= 1000)
++        {
++            fprintf(file, "%ld fps=%.1f avg_ms=%.2f max_ms=%.2f slow=%llu\n", (long)time(NULL),
++                    frames * 1000.0 / window_ms, window_ms / frames, max_ms, (unsigned long long)slow);
++            window_start = now;
++            frames = slow = 0;
++            max_ms = 0;
++        }
++    }
++    else window_start = now;
++    last = now;
++    os_unfair_lock_unlock(&lock);
++}
++
+ @implementation WineMetalLayer
+ 
+     /* Extend [CAMetalLayer nextDrawable] so client_surface_present() can be
+@@ -67,6 +115,7 @@ @implementation WineMetalLayer
+             }
+         }
+ 
++        fps_log_frame();
+         return [super nextDrawable];
+     }
+ 

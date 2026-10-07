@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 14:19:12 +0200
+Subject: [PATCH] windows.storage: Add an IAsyncOperation<IInspectable *>
+ implementation.
+
+For operations whose result is a runtime class: the caller passes the IID of the typed
+IAsyncOperation<T *>, which has the same layout. Modeled on windows.devices.radios.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: storage-file
+---
+ dlls/windows.storage/async.c   | 153 +++++++++++++++++++++++++++++++++
+ dlls/windows.storage/private.h |   2 +
+ 2 files changed, 155 insertions(+)
+
+diff --git a/dlls/windows.storage/async.c b/dlls/windows.storage/async.c
+index 6a06a8577e8856de4c55bdc77bb11be83aa20b3c..98fdad5e91ae51da44a3f5bf08f4b2f5f293756d 100644
+--- a/dlls/windows.storage/async.c
++++ b/dlls/windows.storage/async.c
+@@ -540,3 +540,156 @@ DEFINE_IASYNCOPERATIONWITHPROGRESS( IAsyncOperationWithProgress_UINT32_UINT32, \
+         IAsyncOperationProgressHandler_UINT32_UINT32, \
+         IAsyncOperationWithProgressCompletedHandler_UINT32_UINT32, \
+         "UInt32,UInt32", async_uint32_uint32, UINT32, VT_UI4, ulVal, async_operation_uint32_uint32_create )
++
++struct async_inspectable
++{
++    IAsyncOperation_IInspectable IAsyncOperation_IInspectable_iface;
++    IAsyncInfoImpl *IAsyncInfoImpl_inner;
++    LONG ref;
++    const GUID *iid;
++};
++
++static inline struct async_inspectable *impl_from_IAsyncOperation_IInspectable( IAsyncOperation_IInspectable *iface )
++{
++    return CONTAINING_RECORD( iface, struct async_inspectable, IAsyncOperation_IInspectable_iface );
++}
++
++static HRESULT WINAPI async_inspectable_QueryInterface( IAsyncOperation_IInspectable *iface, REFIID iid, void **out )
++{
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++
++    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
++
++    if (IsEqualGUID( iid, &IID_IUnknown ) ||
++        IsEqualGUID( iid, &IID_IInspectable ) ||
++        IsEqualGUID( iid, &IID_IAgileObject ) ||
++        IsEqualGUID( iid, impl->iid ))
++    {
++        IInspectable_AddRef( (*out = &impl->IAsyncOperation_IInspectable_iface) );
++        return S_OK;
++    }
++
++    return IAsyncInfoImpl_QueryInterface( impl->IAsyncInfoImpl_inner, iid, out );
++}
++
++static ULONG WINAPI async_inspectable_AddRef( IAsyncOperation_IInspectable *iface )
++{
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++    ULONG ref = InterlockedIncrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++    return ref;
++}
++
++static ULONG WINAPI async_inspectable_Release( IAsyncOperation_IInspectable *iface )
++{
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++    ULONG ref = InterlockedDecrement( &impl->ref );
++    TRACE( "iface %p, ref %lu.\n", iface, ref );
++
++    if (!ref)
++    {
++        /* guard against re-entry if inner releases an outer iface */
++        InterlockedIncrement( &impl->ref );
++        IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
++        free( impl );
++    }
++
++    return ref;
++}
++
++static HRESULT WINAPI async_inspectable_GetIids( IAsyncOperation_IInspectable *iface, ULONG *iid_count, IID **iids )
++{
++    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_inspectable_GetRuntimeClassName( IAsyncOperation_IInspectable *iface, HSTRING *class_name )
++{
++    return WindowsCreateString( L"Windows.Foundation.IAsyncOperation`1<IInspectable>",
++                                ARRAY_SIZE(L"Windows.Foundation.IAsyncOperation`1<IInspectable>"),
++                                class_name );
++}
++
++static HRESULT WINAPI async_inspectable_GetTrustLevel( IAsyncOperation_IInspectable *iface, TrustLevel *trust_level )
++{
++    FIXME( "iface %p, trust_level %p stub!\n", iface, trust_level );
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI async_inspectable_put_Completed( IAsyncOperation_IInspectable *iface,
++                                                       IAsyncOperationCompletedHandler_IInspectable *typed_handler )
++{
++    IAsyncOperationCompletedHandlerImpl *handler = (IAsyncOperationCompletedHandlerImpl *)typed_handler;
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return IAsyncInfoImpl_put_Completed( impl->IAsyncInfoImpl_inner, handler );
++}
++
++static HRESULT WINAPI async_inspectable_get_Completed( IAsyncOperation_IInspectable *iface,
++                                                       IAsyncOperationCompletedHandler_IInspectable **typed_handler )
++{
++    IAsyncOperationCompletedHandlerImpl **handler = (IAsyncOperationCompletedHandlerImpl **)typed_handler;
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++    TRACE( "iface %p, handler %p.\n", iface, handler );
++    return IAsyncInfoImpl_get_Completed( impl->IAsyncInfoImpl_inner, handler );
++}
++
++static HRESULT WINAPI async_inspectable_GetResults( IAsyncOperation_IInspectable *iface, IInspectable **results )
++{
++    struct async_inspectable *impl = impl_from_IAsyncOperation_IInspectable( iface );
++    PROPVARIANT result = {.vt = VT_UNKNOWN};
++    HRESULT hr;
++
++    TRACE( "iface %p, results %p.\n", iface, results );
++
++    *results = NULL;
++    if (SUCCEEDED(hr = IAsyncInfoImpl_get_Result( impl->IAsyncInfoImpl_inner, &result )))
++    {
++        if ((*results = (IInspectable *)result.punkVal)) IInspectable_AddRef( *results );
++        PropVariantClear( &result );
++    }
++
++    return hr;
++}
++
++static const struct IAsyncOperation_IInspectableVtbl async_inspectable_vtbl =
++{
++    /* IUnknown methods */
++    async_inspectable_QueryInterface,
++    async_inspectable_AddRef,
++    async_inspectable_Release,
++    /* IInspectable methods */
++    async_inspectable_GetIids,
++    async_inspectable_GetRuntimeClassName,
++    async_inspectable_GetTrustLevel,
++    /* IAsyncOperation<IInspectable> */
++    async_inspectable_put_Completed,
++    async_inspectable_get_Completed,
++    async_inspectable_GetResults,
++};
++
++HRESULT async_operation_inspectable_create( const GUID *iid, IUnknown *invoker, IUnknown *param,
++        async_operation_callback callback, IAsyncOperation_IInspectable **out )
++{
++    struct async_inspectable *impl;
++    HRESULT hr;
++
++    *out = NULL;
++    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
++    impl->IAsyncOperation_IInspectable_iface.lpVtbl = &async_inspectable_vtbl;
++    impl->ref = 1;
++    impl->iid = iid;
++
++    if (FAILED(hr = async_info_create( invoker, param, callback,
++            (IInspectable *)&impl->IAsyncOperation_IInspectable_iface, &impl->IAsyncInfoImpl_inner ))
++            || FAILED(hr = IAsyncInfoImpl_Start( impl->IAsyncInfoImpl_inner )))
++    {
++        if (impl->IAsyncInfoImpl_inner) IAsyncInfoImpl_Release( impl->IAsyncInfoImpl_inner );
++        free( impl );
++        return hr;
++    }
++
++    *out = &impl->IAsyncOperation_IInspectable_iface;
++    TRACE( "created IAsyncOperation_IInspectable %p.\n", *out );
++    return S_OK;
++}
+diff --git a/dlls/windows.storage/private.h b/dlls/windows.storage/private.h
+index 21ef87124e04d23871339a29ed82d0ba19453a75..082fda42dc6bedcf21be75fb046ff90f27dfff41 100644
+--- a/dlls/windows.storage/private.h
++++ b/dlls/windows.storage/private.h
+@@ -45,6 +45,8 @@ HRESULT async_operation_buffer_uint32_create( IUnknown *invoker, IUnknown *param
+         IAsyncOperationWithProgress_IBuffer_UINT32 **out );
+ HRESULT async_operation_uint32_uint32_create( IUnknown *invoker, IUnknown *param, async_operation_callback callback,
+         IAsyncOperationWithProgress_UINT32_UINT32 **out );
++HRESULT async_operation_inspectable_create( const GUID *iid, IUnknown *invoker, IUnknown *param,
++        async_operation_callback callback, IAsyncOperation_IInspectable **out );
+ 
+ extern IActivationFactory *random_access_stream_reference_factory;
+ extern IActivationFactory *memory_stream_activation_factory;

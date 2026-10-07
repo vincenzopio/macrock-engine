@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "components": {
+    "wine": {
+      "url": "https://gitlab.winehq.org/wine/wine.git",
+      "ref": "wine-11.17",
+      "commit": "36b6a2cf679fb395f668a917b76537190e212d9c",
+      "license": "LGPL-2.1-or-later",
+      "regenerate": [
+        {
+          "command": [
+            "perl",
+            "tools/make_requests"
+          ],
+          "files": [
+            "include/wine/server_protocol.h",
+            "server/request_handlers.h",
+            "server/request_trace.h"
+          ]
+        },
+        {
+          "command": [
+            "sh",
+            "-c",
+            "autoconf && rm -rf autom4te.cache configure~"
+          ],
+          "files": [
+            "configure"
+          ]
+        }
+      ]
+    },
+    "xgameruntime": {
+      "url": "https://github.com/xodus-gaming/xgameruntime.git",
+      "ref": "refs/pull/18/head",
+      "commit": "8dd2aa0044c0fc72d600fbe80f3b1e201e3181fb",
+      "license": "LGPL-2.1-or-later",
+      "submodules": true
+    },
+    "xodus": {
+      "url": "https://github.com/xodus-gaming/xodus.git",
+      "ref": "main",
+      "commit": "53ea781dcd073e31d7ea68e894134e9c959bff04",
+      "license": "GPL-3.0-only"
+    }
+  }
+}

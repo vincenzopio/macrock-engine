@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 00:53:11 +0200
+Subject: [PATCH] xodus: Keep each request's reply alive and handle one request
+ at a time.
+
+The reply handler kept the reply packet without a reference, and the socket thread released it as
+soon as the handlers returned, so callers read a freed packet; take a reference for the caller.
+The socket thread walked the handler list while requests added and removed handlers from other
+threads; lock it. Replies carry no request id, so the first reply went to every waiting request:
+send one request at a time. A request that failed left its handler, which points into its stack,
+in the list, and leaked its event; clean both up on every path.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: xodus-protocol
+---
+ src/Xodus/IPCLayer.cpp | 57 +++++++++++++++++++++++++++++++++---------
+ 1 file changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/src/Xodus/IPCLayer.cpp b/src/Xodus/IPCLayer.cpp
+index 7879a4efaa82a2ed5a82ea8c1a0ac43fb7e6d275..1b7d1368c42909ec5aac6e2f983789f30d3a4912 100644
+--- a/src/Xodus/IPCLayer.cpp
++++ b/src/Xodus/IPCLayer.cpp
+@@ -33,6 +33,7 @@
+ #include <winstring.h>
+ #include <afunix.h>
+ #include <atomic>
++#include <mutex>
+ 
+ using namespace ABI;
+ using namespace ABI::Xodus;
+@@ -173,6 +174,7 @@ public:
+         handler->AddRef();
+         token->value = m_NextEventToken++;
+         newCallback->token = token->value;
++        const std::lock_guard<std::mutex> lock( m_CallbacksLock );
+         list_add_head( &m_Callbacks, &newCallback->entry );
+ 
+         return S_OK;
+@@ -185,12 +187,14 @@ public:
+ 
+         TRACE("token %lld.\n", token.value);
+ 
++        const std::lock_guard<std::mutex> lock( m_CallbacksLock );
+         LIST_FOR_EACH_ENTRY( oldCallback, &m_Callbacks, response_received_callback, entry )
+         {
+             if ( oldCallback->token == token.value )
+             {
+                 oldCallback->handler->Release();
+                 list_remove( &oldCallback->entry );
++                delete oldCallback;
+                 return S_OK;
+             }
+         }
+@@ -392,14 +396,13 @@ private:
+         auto packet = static_cast<IXodusIPCPacket *>( param );
+ 
+         BYTE* messageBuffer;
+-        DWORD asyncres;
+         HRESULT status = S_OK;
+         NTSTATUS nts;
+         IPCFrame frame{};
+         IPCHeader_CTYPE header{};
+         EventRegistrationToken token{};
+-        SendRequestContext context{ .event = CreateEventW(nullptr, TRUE, FALSE, nullptr) };
+-        IPCResponseHandler *handler = new IPCResponseHandler( SendRequestResponseHandler, (PVOID)&context );
++        SendRequestContext context{};
++        IPCResponseHandler *handler;
+ 
+         IBuffer *message;
+         IBufferByteAccess *messageBufferByteAccess;
+@@ -433,20 +436,42 @@ private:
+         RtlCopyMemory( frame.frame + sizeof(MagicHeaderType) + sizeof(UINT16), &header.MessageLength, sizeof(UINT16) );
+         RtlCopyMemory( frame.frame + sizeof(IPCHeader_CTYPE), messageBuffer, header.MessageLength );
+ 
++        if ( !( context.event = CreateEventW( nullptr, TRUE, FALSE, nullptr ) ) )
++        {
++            CoTaskMemFree( frame.frame );
++            return HRESULT_FROM_WIN32( GetLastError() );
++        }
++        handler = new IPCResponseHandler( SendRequestResponseHandler, (PVOID)&context );
++
++        /* Replies carry no request id: they come in the order of the requests, so have one
++         * request at a time waiting for its reply. */
++        const std::lock_guard<std::mutex> requestLock( iface->m_RequestLock );
++
+         status = iface->add_ResponseReceived( handler, &token );
+-        if ( FAILED( status ) ) return status;
++        handler->Release(); /* the callback list holds it until it is removed */
++        if ( FAILED( status ) )
++        {
++            CoTaskMemFree( frame.frame );
++            CloseHandle( context.event );
++            return status;
++        }
+ 
+         nts = SendFrame( &frame );
+         CoTaskMemFree( frame.frame );
+-        if ( FAILED( nts ) ) return HRESULT_FROM_NT( nts );
++        if ( !FAILED( nts ) )
++            WaitForSingleObject( context.event, IPC_REQUEST_TIMEOUT_MS );
+ 
+-        asyncres = WaitForSingleObject( context.event, IPC_REQUEST_TIMEOUT_MS );
++        /* Once removed, the handler is no longer invoked: context.response is final. */
++        iface->remove_ResponseReceived( token );
+         CloseHandle( context.event );
+-        status = iface->remove_ResponseReceived( token );
+-        if ( FAILED( status ) ) return status;
+-        if ( asyncres )
++        if ( FAILED( nts ) )
+         {
+-            WARN("Timeout while waiting for %p to respond.\n", handler);
++            if ( context.response ) context.response->Release();
++            return HRESULT_FROM_NT( nts );
++        }
++        if ( !context.response )
++        {
++            WARN("Timeout while waiting for a reply to message type %u.\n", header.Message_Type);
+             return HRESULT_FROM_WIN32( ERROR_TIMEOUT );
+         }
+ 
+@@ -474,6 +499,9 @@ private:
+         if ( messageType == 2 /* PONG */ )
+             TRACE("Got PONGED!\n");
+ 
++        /* The socket thread releases the packet once its handlers return. */
++        if ( ctx->response ) return S_OK;
++        packet->AddRef();
+         ctx->response = packet;
+         SetEvent( ctx->event );
+         return S_OK;
+@@ -576,9 +604,12 @@ private:
+ 
+                 messageBufferAccess->Release();
+ 
+-                LIST_FOR_EACH_ENTRY( currCallback, &iface->m_Callbacks, response_received_callback, entry )
+                 {
+-                    currCallback->handler->Invoke( xodusPacket );
++                    const std::lock_guard<std::mutex> lock( iface->m_CallbacksLock );
++                    LIST_FOR_EACH_ENTRY( currCallback, &iface->m_Callbacks, response_received_callback, entry )
++                    {
++                        currCallback->handler->Invoke( xodusPacket );
++                    }
+                 }
+                 // ---- //
+ 
+@@ -605,6 +636,8 @@ private:
+     };
+ 
+     struct list m_Callbacks = LIST_INIT( m_Callbacks );
++    std::mutex m_CallbacksLock; /* m_Callbacks, which the socket thread walks */
++    std::mutex m_RequestLock;
+     std::atomic<INT64> m_NextEventToken{ 0 };
+     std::atomic_long ref{ 1 };
+ };

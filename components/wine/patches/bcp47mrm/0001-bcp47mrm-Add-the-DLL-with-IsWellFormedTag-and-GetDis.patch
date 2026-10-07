@@ -1,0 +1,441 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 14:28:06 +0200
+Subject: [PATCH] bcp47mrm: Add the DLL, with IsWellFormedTag and
+ GetDistanceOfClosestLanguageInList.
+
+The Windows App SDK's resource manager (Microsoft.Windows.ApplicationModel.Resources.dll)
+imports IsWellFormedTag from bcp47mrm.dll and looks up GetDistanceOfClosestLanguageInList;
+without them the file picker of programs that ship the SDK self-contained (Minecraft Bedrock)
+fails. IsWellFormedTag checks the langtag syntax of RFC 5646 and its irregular grandfathered
+tags, without the registry. GetDistanceOfClosestLanguageInList gives 1.0 for the same tag, 0.5
+for the same language, and ERROR_NO_MATCH with 0.0 otherwise.
+
+Original work for macrock (LGPL-2.1-or-later).
+
+Topic: bcp47mrm
+---
+ configure                       |   3 +
+ configure.ac                    |   2 +
+ dlls/bcp47mrm/Makefile.in       |   5 +
+ dlls/bcp47mrm/bcp47mrm.spec     |   2 +
+ dlls/bcp47mrm/main.c            | 173 ++++++++++++++++++++++++++++++++
+ dlls/bcp47mrm/tests/Makefile.in |   5 +
+ dlls/bcp47mrm/tests/bcp47mrm.c  | 106 +++++++++++++++++++
+ include/Makefile.in             |   1 +
+ include/bcp47mrm.h              |  34 +++++++
+ 9 files changed, 331 insertions(+)
+ create mode 100644 dlls/bcp47mrm/Makefile.in
+ create mode 100644 dlls/bcp47mrm/bcp47mrm.spec
+ create mode 100644 dlls/bcp47mrm/main.c
+ create mode 100644 dlls/bcp47mrm/tests/Makefile.in
+ create mode 100644 dlls/bcp47mrm/tests/bcp47mrm.c
+ create mode 100644 include/bcp47mrm.h
+
+diff --git a/configure b/configure
+index 50b80064359dda4f9655d0aaf6023932b55fdf87..f266582b1ae0ecde67b70fc727d871251a728a3f 100755
+--- a/configure
++++ b/configure
+@@ -1016,6 +1016,7 @@ enable_avicap32
+ enable_avifil32
+ enable_avrt
+ enable_bcp47langs
++enable_bcp47mrm
+ enable_bcrypt
+ enable_bcryptprimitives
+ enable_bluetoothapis
+@@ -22057,6 +22058,8 @@ wine_fn_config_makefile dlls/avifile.dll16 enable_win16
+ wine_fn_config_makefile dlls/avrt enable_avrt
+ wine_fn_config_makefile dlls/bcp47langs enable_bcp47langs
+ wine_fn_config_makefile dlls/bcp47langs/tests enable_tests
++wine_fn_config_makefile dlls/bcp47mrm enable_bcp47mrm
++wine_fn_config_makefile dlls/bcp47mrm/tests enable_tests
+ wine_fn_config_makefile dlls/bcrypt enable_bcrypt
+ wine_fn_config_makefile dlls/bcrypt/tests enable_tests
+ wine_fn_config_makefile dlls/bcryptprimitives enable_bcryptprimitives
+diff --git a/configure.ac b/configure.ac
+index eae581fea2792bcd42b049ae089c56e757b2b2fc..7eca1fb7b0edb91a3693cfac690a173909747508 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2502,6 +2502,8 @@ WINE_CONFIG_MAKEFILE(dlls/avifile.dll16)
+ WINE_CONFIG_MAKEFILE(dlls/avrt)
+ WINE_CONFIG_MAKEFILE(dlls/bcp47langs)
+ WINE_CONFIG_MAKEFILE(dlls/bcp47langs/tests)
++WINE_CONFIG_MAKEFILE(dlls/bcp47mrm)
++WINE_CONFIG_MAKEFILE(dlls/bcp47mrm/tests)
+ WINE_CONFIG_MAKEFILE(dlls/bcrypt)
+ WINE_CONFIG_MAKEFILE(dlls/bcrypt/tests)
+ WINE_CONFIG_MAKEFILE(dlls/bcryptprimitives)
+diff --git a/dlls/bcp47mrm/Makefile.in b/dlls/bcp47mrm/Makefile.in
+new file mode 100644
+index 0000000000000000000000000000000000000000..390453eea7c4e2faf9878eed2f1f04824072c2ef
+--- /dev/null
++++ b/dlls/bcp47mrm/Makefile.in
+@@ -0,0 +1,5 @@
++MODULE    = bcp47mrm.dll
++IMPORTLIB = bcp47mrm
++
++SOURCES = \
++	main.c
+diff --git a/dlls/bcp47mrm/bcp47mrm.spec b/dlls/bcp47mrm/bcp47mrm.spec
+new file mode 100644
+index 0000000000000000000000000000000000000000..be827293e21251bc4a8c1c750f42c13bb62efc5b
+--- /dev/null
++++ b/dlls/bcp47mrm/bcp47mrm.spec
+@@ -0,0 +1,2 @@
++@ stdcall GetDistanceOfClosestLanguageInList(wstr wstr long ptr)
++@ stdcall IsWellFormedTag(wstr)
+diff --git a/dlls/bcp47mrm/main.c b/dlls/bcp47mrm/main.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..aed114c24d817a94e7ba1b9c4c7e42ea6089c328
+--- /dev/null
++++ b/dlls/bcp47mrm/main.c
+@@ -0,0 +1,173 @@
++/*
++ * BCP 47 language tags for the Windows resource manager (MRM)
++ *
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#include "windef.h"
++#include "winbase.h"
++
++#include "bcp47mrm.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(bcp47mrm);
++
++/* The irregular grandfathered tags of RFC 5646, which the langtag syntax does not cover. */
++static const WCHAR *irregular_tags[] =
++{
++    L"en-GB-oed", L"i-ami", L"i-bnn", L"i-default", L"i-enochian", L"i-hak", L"i-klingon", L"i-lux",
++    L"i-mingo", L"i-navajo", L"i-pwn", L"i-tao", L"i-tay", L"i-tsu", L"sgn-BE-FR", L"sgn-BE-NL", L"sgn-CH-DE",
++};
++
++/* Where a subtag is in a tag, in the order of the langtag production of RFC 5646. */
++enum part
++{
++    PART_START,
++    PART_LANGUAGE,
++    PART_EXTLANG,
++    PART_SCRIPT,
++    PART_REGION,
++    PART_VARIANT,
++    PART_EXTENSION,
++    PART_PRIVATE_USE,
++};
++
++static BOOL is_alpha( WCHAR c )
++{
++    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
++}
++
++static BOOL is_digit( WCHAR c )
++{
++    return c >= '0' && c <= '9';
++}
++
++static BOOL all_alpha( const WCHAR *str, unsigned int len )
++{
++    while (len--) if (!is_alpha( *str++ )) return FALSE;
++    return TRUE;
++}
++
++static BOOL all_digits( const WCHAR *str, unsigned int len )
++{
++    while (len--) if (!is_digit( *str++ )) return FALSE;
++    return TRUE;
++}
++
++/* Syntax only (RFC 5646 calls it well-formed): the subtags are not checked against the registry. */
++BOOL WINAPI IsWellFormedTag( const WCHAR *tag )
++{
++    const WCHAR *subtag = tag, *end;
++    enum part part = PART_START;
++    unsigned int i, len, extlangs = 0;
++    BOOL extlang_allowed = FALSE, pending = FALSE; /* a singleton or "x" needs one more subtag */
++
++    TRACE( "tag %s.\n", debugstr_w(tag) );
++
++    if (!tag) return FALSE;
++    for (i = 0; i < ARRAY_SIZE(irregular_tags); i++)
++        if (!wcsicmp( tag, irregular_tags[i] )) return TRUE;
++
++    for (;;)
++    {
++        for (end = subtag; *end && *end != '-'; end++)
++            if (!is_alpha( *end ) && !is_digit( *end )) return FALSE;
++        len = end - subtag;
++        if (!len || len > 8) return FALSE;
++
++        if (part == PART_PRIVATE_USE) pending = FALSE;
++        else if (part == PART_EXTENSION && len > 1) pending = FALSE;
++        else if (len == 1)
++        {
++            BOOL private_use = subtag[0] == 'x' || subtag[0] == 'X';
++
++            /* A tag starts with a language or "x"; a singleton needs a subtag before the next one. */
++            if ((part == PART_START && !private_use) || pending) return FALSE;
++            part = private_use ? PART_PRIVATE_USE : PART_EXTENSION;
++            pending = TRUE;
++        }
++        else if (part == PART_START)
++        {
++            if (!all_alpha( subtag, len )) return FALSE;
++            part = PART_LANGUAGE;
++            extlang_allowed = len <= 3;
++        }
++        else if (len == 3 && all_alpha( subtag, len ) && extlang_allowed && part <= PART_EXTLANG && extlangs < 3)
++        {
++            part = PART_EXTLANG;
++            extlangs++;
++        }
++        else if (len == 4 && all_alpha( subtag, len ) && part < PART_SCRIPT)
++            part = PART_SCRIPT;
++        else if (((len == 2 && all_alpha( subtag, len )) || (len == 3 && all_digits( subtag, len ))) && part < PART_REGION)
++            part = PART_REGION;
++        else if ((len >= 5 || (len == 4 && is_digit( subtag[0] ))) && part <= PART_VARIANT)
++            part = PART_VARIANT;
++        else
++            return FALSE;
++
++        if (!*end) return !pending;
++        subtag = end + 1;
++    }
++}
++
++static unsigned int language_length( const WCHAR *tag, unsigned int len )
++{
++    unsigned int i = 0;
++
++    while (i < len && tag[i] != '-') i++;
++    return i;
++}
++
++/* 1.0 for the same tag, 0.5 for the same language, 0.0 otherwise. */
++static double tag_distance( const WCHAR *a, unsigned int a_len, const WCHAR *b, unsigned int b_len )
++{
++    unsigned int a_language = language_length( a, a_len ), b_language = language_length( b, b_len );
++
++    if (a_len == b_len && !wcsnicmp( a, b, a_len )) return 1.0;
++    if (a_language == b_language && !wcsnicmp( a, b, a_language )) return 0.5;
++    return 0.0;
++}
++
++HRESULT WINAPI GetDistanceOfClosestLanguageInList( const WCHAR *language, const WCHAR *list, WCHAR delimiter,
++                                                   double *distance )
++{
++    const WCHAR *tag, *end;
++    double best = 0.0, current;
++    unsigned int len;
++
++    TRACE( "language %s, list %s, delimiter %#x, distance %p.\n", debugstr_w(language), debugstr_w(list),
++           delimiter, distance );
++
++    if (!language || !list || !distance) return E_INVALIDARG;
++
++    /* With L'\0' as the delimiter, the list is double null-terminated. */
++    for (tag = list;; tag = end + 1)
++    {
++        if (delimiter) for (end = tag; *end && *end != delimiter; end++) ;
++        else end = tag + wcslen( tag );
++        if ((len = end - tag) && (current = tag_distance( language, wcslen( language ), tag, len )) > best)
++            best = current;
++        if (delimiter ? !*end : !len) break;
++    }
++
++    *distance = best;
++    return best > 0.0 ? S_OK : HRESULT_FROM_WIN32( ERROR_NO_MATCH );
++}
+diff --git a/dlls/bcp47mrm/tests/Makefile.in b/dlls/bcp47mrm/tests/Makefile.in
+new file mode 100644
+index 0000000000000000000000000000000000000000..040366cfbc5184154fac3a3e36b26b93a4890245
+--- /dev/null
++++ b/dlls/bcp47mrm/tests/Makefile.in
+@@ -0,0 +1,5 @@
++TESTDLL = bcp47mrm.dll
++IMPORTS = bcp47mrm
++
++SOURCES = \
++	bcp47mrm.c
+diff --git a/dlls/bcp47mrm/tests/bcp47mrm.c b/dlls/bcp47mrm/tests/bcp47mrm.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..849bb6335d44afb04b517c6355bdd2407d27678a
+--- /dev/null
++++ b/dlls/bcp47mrm/tests/bcp47mrm.c
+@@ -0,0 +1,106 @@
++/*
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++
++#include "windef.h"
++#include "winbase.h"
++
++#include "bcp47mrm.h"
++
++#include "wine/test.h"
++
++static void test_IsWellFormedTag(void)
++{
++    /* The examples of RFC 5646, appendix A, and some plain syntax errors. */
++    static const struct
++    {
++        const WCHAR *tag;
++        BOOL well_formed;
++    }
++    tests[] =
++    {
++        { L"de", TRUE },
++        { L"en-US", TRUE },
++        { L"zh-Hant", TRUE },
++        { L"zh-Hant-TW", TRUE },
++        { L"sr-Latn-RS", TRUE },
++        { L"es-419", TRUE },
++        { L"zh-yue-HK", TRUE },
++        { L"sl-rozaj-biske", TRUE },
++        { L"de-CH-1901", TRUE },
++        { L"hy-Latn-IT-arevela", TRUE },
++        { L"de-DE-u-co-phonebk", TRUE },
++        { L"en-US-x-twain", TRUE },
++        { L"x-whatever", TRUE },
++        { L"qaa-Qaaa-QM-x-southern", TRUE },
++        { L"i-klingon", TRUE },
++        { L"EN-us", TRUE },
++        { L"", FALSE },
++        { L"e", FALSE },
++        { L"a-DE", FALSE },
++        { L"de-419-DE", FALSE },
++        { L"en-", FALSE },
++        { L"-en", FALSE },
++        { L"en--US", FALSE },
++        { L"en_US", FALSE },
++        { L"en-US-x", FALSE },
++        { L"en-a-x-foo", FALSE },
++        { L"toolongtag", FALSE },
++        { L"en-toolongtag", FALSE },
++    };
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(tests); i++)
++    {
++        BOOL ret = IsWellFormedTag( tests[i].tag );
++        ok( !ret == !tests[i].well_formed, "%s: got %d.\n", debugstr_w(tests[i].tag), ret );
++    }
++}
++
++static void test_GetDistanceOfClosestLanguageInList(void)
++{
++    double distance;
++    HRESULT hr;
++
++    distance = -1.0;
++    hr = GetDistanceOfClosestLanguageInList( L"en-US", L"fr-FR;en-US;de-DE", ';', &distance );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( distance == 1.0, "got distance %f.\n", distance );
++
++    distance = -1.0;
++    hr = GetDistanceOfClosestLanguageInList( L"de-DE", L"fr-FR\0de-DE\0", 0, &distance );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( distance == 1.0, "got distance %f.\n", distance );
++
++    distance = -1.0;
++    hr = GetDistanceOfClosestLanguageInList( L"en-GB", L"fr-FR;en-US", ';', &distance );
++    ok( hr == S_OK, "got hr %#lx.\n", hr );
++    ok( distance > 0.0 && distance < 1.0, "got distance %f.\n", distance );
++
++    distance = -1.0;
++    hr = GetDistanceOfClosestLanguageInList( L"en-US", L"fr-FR;de-DE", ';', &distance );
++    ok( hr == HRESULT_FROM_WIN32( ERROR_NO_MATCH ), "got hr %#lx.\n", hr );
++    ok( distance == 0.0, "got distance %f.\n", distance );
++}
++
++START_TEST(bcp47mrm)
++{
++    test_IsWellFormedTag();
++    test_GetDistanceOfClosestLanguageInList();
++}
+diff --git a/include/Makefile.in b/include/Makefile.in
+index c2c998448a1fc66c7256a13b264a4d6d319eac54..6bdb57011869c602ef009bd8450042077107a959 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -47,6 +47,7 @@ SOURCES = \
+ 	axextendenums.h \
+ 	basetsd.h \
+ 	basetyps.h \
++	bcp47mrm.h \
+ 	bcrypt.h \
+ 	bdaiface.idl \
+ 	bdaiface_enums.h \
+diff --git a/include/bcp47mrm.h b/include/bcp47mrm.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..06d442ce3422921d0836eabf1954186a30c7df77
+--- /dev/null
++++ b/include/bcp47mrm.h
+@@ -0,0 +1,34 @@
++/*
++ * Copyright 2026 vincenzopio (macrock)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef _BCP47MRM_H_
++#define _BCP47MRM_H_
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++HRESULT WINAPI GetDistanceOfClosestLanguageInList(const WCHAR *language, const WCHAR *list, WCHAR delimiter,
++                                                  double *distance);
++BOOL WINAPI IsWellFormedTag(const WCHAR *tag);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif  /* _BCP47MRM_H_ */

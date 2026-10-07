@@ -1,0 +1,3897 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 21:06:53 +0200
+Subject: [PATCH] ntdll, server: Add msync, Rosetta code regions and
+ WINEDLLPATH_PREPEND.
+
+Unchanged from hsr-wine-d3dmetal patches/wine-p3/0001-host-msync.patch (LGPL-2.1-or-later,
+derived from CrossOver FOSS 26.3): msync, Rosetta code-region registration through
+libd3dshared, the PE-side __wine_unix_call carry, the GS overlay and WINEDLLPATH_PREPEND. The
+server headers are regenerated with tools/make_requests (protocol 962).
+
+Topic: msync
+---
+ dlls/ntdll/Makefile.in          |    1 +
+ dlls/ntdll/loader.c             |   44 +-
+ dlls/ntdll/ntdll.spec           |    1 +
+ dlls/ntdll/unix/loader.c        |  152 +++-
+ dlls/ntdll/unix/msync.c         | 1162 +++++++++++++++++++++++++++++++
+ dlls/ntdll/unix/msync.h         |   49 ++
+ dlls/ntdll/unix/signal_x86_64.c |  301 ++++++--
+ dlls/ntdll/unix/sync.c          |   94 ++-
+ dlls/ntdll/unix/system.c        |   31 +
+ dlls/ntdll/unix/thread.c        |   10 +
+ dlls/ntdll/unix/virtual.c       |   79 +++
+ dlls/ntdll/unixlib.h            |    9 +
+ dlls/wow64cpu/cpu.c             |  145 +++-
+ include/wine/server_protocol.h  |    4 +-
+ server/Makefile.in              |    1 +
+ server/inproc_sync.c            |  179 ++++-
+ server/main.c                   |    3 +
+ server/msync.c                  |  821 ++++++++++++++++++++++
+ server/msync.h                  |   51 ++
+ server/protocol.def             |    1 +
+ server/request_handlers.h       |    3 +-
+ server/request_trace.h          |    1 +
+ server/thread.c                 |    7 +
+ server/window.c                 |    4 +-
+ 24 files changed, 3077 insertions(+), 76 deletions(-)
+ create mode 100644 dlls/ntdll/unix/msync.c
+ create mode 100644 dlls/ntdll/unix/msync.h
+ create mode 100644 server/msync.c
+ create mode 100644 server/msync.h
+
+diff --git a/dlls/ntdll/Makefile.in b/dlls/ntdll/Makefile.in
+index 9a15bc319a4fda08a9d5e678e4cec4ced959d9bc..34fff334f699c58ace82e8689a12e12ea05d115c 100644
+--- a/dlls/ntdll/Makefile.in
++++ b/dlls/ntdll/Makefile.in
+@@ -54,6 +54,7 @@ SOURCES = \
+ 	unix/debug.c \
+ 	unix/env.c \
+ 	unix/file.c \
++	unix/msync.c \
+ 	unix/loader.c \
+ 	unix/loadorder.c \
+ 	unix/process.c \
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index a0992cf68d3b76bd2b0242fd9e08436aba90cda4..efba54e4f94340f9d055249cd86920a7dad15dfa 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -1393,6 +1393,9 @@ static BOOL alloc_tls_slot( LDR_DATA_TABLE_ENTRY *mod )
+             if (!new) return FALSE;
+             if (old) memcpy( new, old, old_module_count * sizeof(*new) );
+             teb->ThreadLocalStoragePointer = new;
++#ifdef __x86_64__ /* The Unix host records the macOS pthread overlay here. */
++            if (teb->Instrumentation[0]) ((TEB *)teb->Instrumentation[0])->ThreadLocalStoragePointer = new;
++#endif
+             TRACE( "thread %04lx tls block %p -> %p\n", HandleToULong(teb->ClientId.UniqueThread), old, new );
+             /* FIXME: can't free old block here, should be freed at thread exit */
+         }
+@@ -1594,11 +1597,18 @@ static WINE_MODREF *alloc_module( HMODULE hModule, const UNICODE_STRING *nt_name
+         ERR( "rtl_rb_tree_put failed.\n" );
+     /* wait until init is called for inserting into InInitializationOrderModuleList */
+ 
++    /* HACK: MEM_EXECUTE_OPTION_ENABLE calls virtual_set_force_exec, which mprotects every mapped
++     * view — brutally slow on macOS 26.x under Rosetta. Skip it if WINE_DISABLE_NX_COMPAT is set. */
+     if (!(nt->OptionalHeader.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT))
+     {
+-        ULONG flags = MEM_EXECUTE_OPTION_ENABLE;
+-        WARN( "disabling no-exec because of %s\n", debugstr_w(wm->ldr.BaseDllName.Buffer) );
+-        NtSetInformationProcess( GetCurrentProcess(), ProcessExecuteFlags, &flags, sizeof(flags) );
++        UNICODE_STRING val_str, name_str = RTL_CONSTANT_STRING( L"WINE_DISABLE_NX_COMPAT" );
++        val_str.MaximumLength = 0;
++        if (RtlQueryEnvironmentVariable_U( NULL, &name_str, &val_str ) == STATUS_VARIABLE_NOT_FOUND)
++        {
++            ULONG flags = MEM_EXECUTE_OPTION_ENABLE;
++            WARN( "disabling no-exec because of %s\n", debugstr_w(wm->ldr.BaseDllName.Buffer) );
++            NtSetInformationProcess( GetCurrentProcess(), ProcessExecuteFlags, &flags, sizeof(flags) );
++        }
+     }
+     return wm;
+ }
+@@ -1638,6 +1648,10 @@ static NTSTATUS alloc_thread_tls(void)
+         TRACE( "slot %u: %u/%lu bytes at %p\n", i, size, dir->SizeOfZeroFill, pointers[i] );
+     }
+     NtCurrentTeb()->ThreadLocalStoragePointer = pointers;
++#ifdef __x86_64__
++    if (NtCurrentTeb()->Instrumentation[0])
++        ((TEB *)NtCurrentTeb()->Instrumentation[0])->ThreadLocalStoragePointer = pointers;
++#endif
+     return STATUS_SUCCESS;
+ }
+ 
+@@ -2340,6 +2354,15 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name,
+     TRACE_(loaddll)( "Loaded %s at %p: %s\n", debugstr_w(wm->ldr.FullDllName.Buffer), *module,
+                      is_builtin ? "builtin" : "native" );
+ 
++#if defined(__x86_64__)
++    /* CW HACK 22434 */
++    if (is_builtin == FALSE)
++    {
++        struct pe_module_loaded_params params = { *module, (void *)((BYTE *)*module + map_size) };
++        WINE_UNIX_CALL( unix_pe_module_loaded, &params );
++    }
++#endif
++
+     wm->ldr.LoadCount = 1;
+     *pwm = wm;
+     *module = NULL;
+@@ -3419,6 +3442,17 @@ NTSTATUS WINAPI __wine_ctrl_routine( void *arg )
+ }
+ 
+ 
++/***********************************************************************
++ *              __wine_unix_call
++ *
++ * CW HACK 22435: Needed by D3DMetal PE DLLs
++ */
++NTSTATUS WINAPI __wine_unix_call_exported( unixlib_handle_t handle, unsigned int code, void *args )
++{
++    return __wine_unix_call( handle, code, args );
++}
++
++
+ /***********************************************************************
+  *           __wine_unix_spawnvp
+  */
+@@ -3997,6 +4031,10 @@ void WINAPI LdrShutdownThread(void)
+     if ((pointers = NtCurrentTeb()->ThreadLocalStoragePointer))
+     {
+         NtCurrentTeb()->ThreadLocalStoragePointer = NULL;
++#ifdef __x86_64__
++        if (NtCurrentTeb()->Instrumentation[0])
++            ((TEB *)NtCurrentTeb()->Instrumentation[0])->ThreadLocalStoragePointer = NULL;
++#endif
+         for (i = 0; i < tls_module_count; i++) RtlFreeHeap( GetProcessHeap(), 0, pointers[i] );
+         RtlFreeHeap( GetProcessHeap(), 0, pointers );
+     }
+diff --git a/dlls/ntdll/ntdll.spec b/dlls/ntdll/ntdll.spec
+index 2c66313e6ce8a81935ed9f8162d6d8c98850fb6e..23acfd4676a45e1ed2cfb1cd51d8e6c11557100d 100644
+--- a/dlls/ntdll/ntdll.spec
++++ b/dlls/ntdll/ntdll.spec
+@@ -1770,6 +1770,7 @@
+ @ extern -private __wine_syscall_dispatcher
+ @ extern -private __wine_unix_call_dispatcher
+ @ extern -private -arch=arm64ec __wine_unix_call_dispatcher_arm64ec
++@ stdcall __wine_unix_call(int64 long ptr) __wine_unix_call_exported
+ @ extern -private __wine_unixlib_handle
+ 
+ # Debugging
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 0d43c5c65e35298acfa551c2ba2656d0f5c4a1d4..9b2db551c54421de9b33821a49748a9650799b32 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -36,6 +36,7 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <sys/mman.h>
++#include <time.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
+ #include <dlfcn.h>
+@@ -86,6 +87,7 @@
+ #include "winioctl.h"
+ #include "winternl.h"
+ #include "unix_private.h"
++#include "msync.h"
+ #include "wine/list.h"
+ #include "wine/debug.h"
+ 
+@@ -294,13 +296,22 @@ static WORD get_alt_machine( WORD machine )
+ static void set_dll_path(void)
+ {
+     char *p, *path = getenv( "WINEDLLPATH" );
++    char *path_prepend = getenv( "WINEDLLPATH_PREPEND" );
+     int i, count = 0;
+ 
+-    if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
++    if (path) for (p = path, count++; *p; p++) if (*p == ':') count++;
++    if (path_prepend) for (p = path_prepend, count++; *p; p++) if (*p == ':') count++;
+ 
+     dll_paths = malloc( (count + 2) * sizeof(*dll_paths) );
+     count = 0;
+ 
++    if (path_prepend)
++    {
++        path_prepend = strdup( path_prepend );
++        for (p = strtok( path_prepend, ":" ); p; p = strtok( NULL, ":" )) dll_paths[count++] = strdup( p );
++        free( path_prepend );
++    }
++
+     if (!build_dir) dll_paths[count++] = dll_dir;
+ 
+     if (path)
+@@ -435,8 +446,9 @@ char *get_alternate_wineloader( WORD machine )
+ }
+ 
+ 
+-static void preloader_exec( char **argv )
++static void preloader_exec( char **argv, WORD machine )
+ {
++    char *path;
+ #ifdef HAVE_WINE_PRELOADER
+     asprintf( &argv[0], "%s-preloader", argv[1] );
+ #ifdef __APPLE__
+@@ -451,7 +463,12 @@ static void preloader_exec( char **argv )
+     execv( argv[0], argv );
+     free( argv[0] );
+ #endif
+-    execv( argv[1], argv + 1 );
++    path = getenv( "ROSETTA_X87_PATH" );
++    if (path && machine == IMAGE_FILE_MACHINE_I386) {
++        argv[0] = strdup( path );
++        execv( argv[0], argv );
++    } else
++        execv( argv[1], argv + 1 );
+ }
+ 
+ /* exec the appropriate wine loader for the specified machine */
+@@ -461,10 +478,11 @@ static NTSTATUS loader_exec( char **argv, WORD machine )
+ 
+     putenv( noexec );
+ 
+-    if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv );
++    /* CW/Yaagl HACK: keep primary loader path for Rosetta x87 helper. */
++    //if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv );
+ 
+     argv[1] = strdup( wineloader );
+-    preloader_exec( argv );
++    preloader_exec( argv, machine );
+     return STATUS_INVALID_IMAGE_FORMAT;
+ }
+ 
+@@ -1006,6 +1024,68 @@ static NTSTATUS unwind_builtin_dll( void *args )
+ #endif /* SO_DLLS_SUPPORTED */
+ 
+ 
++
++/* CW HACK 22434 */
++#if defined(__APPLE__) && defined(__x86_64__)
++#include <sys/utsname.h>
++#include <stdbool.h>
++static pthread_once_t non_native_init_once = PTHREAD_ONCE_INIT;
++static void *non_native_support_lib;
++static void (*register_non_native_code_region)( void*, void* );
++static bool (*supports_non_native_code_regions)(void);
++
++/* Non-native code region support requires Sonoma or later */
++static BOOL sonoma_or_later(void)
++{
++    struct utsname name;
++    unsigned major, minor;
++
++    if (uname( &name ) == 0 && sscanf( name.release, "%u.%u", &major, &minor ) == 2 &&
++        major >= 23 /* macOS 14 Sonoma */)
++        return TRUE;
++    return FALSE;
++}
++
++static void init_non_native_support(void)
++{
++    char *libd3dshared_path = getenv( "CX_APPLEGPTK_LIBD3DSHARED_PATH" );
++
++    register_non_native_code_region = NULL;
++    supports_non_native_code_regions = NULL;
++
++    if (!libd3dshared_path || !sonoma_or_later())
++        return;
++
++    non_native_support_lib = dlopen( libd3dshared_path, RTLD_LOCAL );
++    if (non_native_support_lib)
++    {
++        register_non_native_code_region = dlsym( non_native_support_lib, "register_non_native_code_region" );
++        supports_non_native_code_regions = dlsym( non_native_support_lib, "supports_non_native_code_regions" );
++
++        TRACE( "Loaded libd3dshared.dylib, does%s support non-native code regions\n",
++                supports_non_native_code_regions ? (supports_non_native_code_regions() ? "" : " not") : " not" );
++    }
++    else
++        TRACE( "Loading libd3dshared.dylib failed: %s\n", dlerror() );
++}
++
++static NTSTATUS pe_module_loaded( void *args )
++{
++    struct pe_module_loaded_params *params = args;
++
++    pthread_once( &non_native_init_once, &init_non_native_support );
++    if ((supports_non_native_code_regions && supports_non_native_code_regions()))
++    {
++        TRACE( "Marking non_native_code_region: %p-%p\n", params->start, params->end );
++        register_non_native_code_region( params->start, params->end );
++    }
++    return STATUS_SUCCESS;
++}
++#elif defined(__x86_64__)
++static NTSTATUS pe_module_loaded( void *args ) { return STATUS_NOT_IMPLEMENTED; }
++#endif
++
++
+ static const unixlib_entry_t unix_call_funcs[] =
+ {
+     load_so_dll,
+@@ -1016,6 +1096,9 @@ static const unixlib_entry_t unix_call_funcs[] =
+     unixcall_wine_server_handle_to_fd,
+     unixcall_wine_spawnvp,
+     system_time_precise,
++#if defined(__x86_64__)
++    pe_module_loaded,
++#endif
+ };
+ 
+ 
+@@ -1024,6 +1107,10 @@ static const unixlib_entry_t unix_call_funcs[] =
+ static NTSTATUS wow64_load_so_dll( void *args ) { return STATUS_INVALID_IMAGE_FORMAT; }
+ static NTSTATUS wow64_unwind_builtin_dll( void *args ) { return STATUS_UNSUCCESSFUL; }
+ 
++#if defined(__x86_64__)
++static NTSTATUS wow64_pe_module_loaded( void *args ) { return STATUS_NOT_IMPLEMENTED; }
++#endif
++
+ const unixlib_entry_t unix_call_wow64_funcs[] =
+ {
+     wow64_load_so_dll,
+@@ -1034,6 +1121,9 @@ const unixlib_entry_t unix_call_wow64_funcs[] =
+     wow64_wine_server_handle_to_fd,
+     wow64_wine_spawnvp,
+     system_time_precise,
++#if defined(__x86_64__)
++    wow64_pe_module_loaded,
++#endif
+ };
+ 
+ #endif  /* _WIN64 */
+@@ -1858,12 +1948,53 @@ static ULONG_PTR get_image_address(void)
+ /***********************************************************************
+  *           start_main_thread
+  */
++
++#if defined(__APPLE__) && defined(__x86_64__)
++static __thread struct tm localtime_tls;
++struct tm *my_localtime(const time_t *timep)
++{
++    return localtime_r(timep, &localtime_tls);
++}
++
++static void hook(void *to_hook, const void *replace)
++{
++    size_t offset;
++
++    struct hooked_function
++    {
++        char jmp[8];
++        const void *dst;
++    } *hooked_function = to_hook;
++    ULONG_PTR intval = (ULONG_PTR)to_hook;
++
++    intval -= (intval % 4096);
++    mprotect((void *)intval, 0x2000, PROT_EXEC | PROT_READ | PROT_WRITE);
++
++    /* The offset is from the end of the jmp instruction (6 bytes) to the start of the destination. */
++    offset = offsetof(struct hooked_function, dst) - offsetof(struct hooked_function, jmp) - 0x6;
++
++    /* jmp *(rip + offset) */
++    hooked_function->jmp[0] = 0xff;
++    hooked_function->jmp[1] = 0x25;
++    hooked_function->jmp[2] = offset;
++    hooked_function->jmp[3] = 0x00;
++    hooked_function->jmp[4] = 0x00;
++    hooked_function->jmp[5] = 0x00;
++    /* Filler */
++    hooked_function->jmp[6] = 0xcc;
++    hooked_function->jmp[7] = 0xcc;
++    /* Dest address absolute */
++    hooked_function->dst = replace;
++}
++#endif
++
+ static void start_main_thread(void)
+ {
+     TEB *teb = virtual_alloc_first_teb();
+ 
+     dbg_init();
+     startup_info_size = server_init_process();
++    msync_init();
+     virtual_map_user_shared_data();
+     init_cpu_info();
+     init_files();
+@@ -1875,6 +2006,13 @@ static void start_main_thread(void)
+     load_ntdll();
+     load_wow64_ntdll( main_image_info.Machine );
+     load_apiset_dll();
++
++#if defined(__APPLE__) && defined(__x86_64__)
++    /* Poking PEB into pthread TLS at offset 0x60 steals Darwin localtime TLS.
++     * Redirect localtime() to a thread-local safe implementation. */
++    hook(localtime, my_localtime);
++#endif
++
+     server_init_process_done();
+ }
+ 
+@@ -2036,8 +2174,8 @@ static void reexec_loader( int argc, char *argv[], char *extra_arg )
+         memcpy( new_argv + 2, argv + 1, argc * sizeof(*argv) );
+     }
+ 
+-    /* default to 32-bit loader to support 32-bit prefixes */
+-    if (machine == IMAGE_FILE_MACHINE_AMD64) machine = IMAGE_FILE_MACHINE_I386;
++    /* CW/Yaagl HACK: do not force 32-bit loader; ROSETTA_X87_PATH handles i386. */
++    //if (machine == IMAGE_FILE_MACHINE_AMD64) machine = IMAGE_FILE_MACHINE_I386;
+ 
+     loader_exec( new_argv, machine );
+     fatal_error( "could not exec the wine loader\n" );
+diff --git a/dlls/ntdll/unix/msync.c b/dlls/ntdll/unix/msync.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae46bf3ba75a58fbc98eb623bb3d72d431abf392
+--- /dev/null
++++ b/dlls/ntdll/unix/msync.c
+@@ -0,0 +1,1162 @@
++/*
++ * mach semaphore-based synchronization objects
++ *
++ * Copyright (C) 2018 Zebediah Figura
++ * Copyright (C) 2023 Marc-Aurel Zent
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#ifdef __APPLE__
++
++#include "config.h"
++
++#include <assert.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/mman.h>
++#ifdef HAVE_SYS_STAT_H
++# include <sys/stat.h>
++#endif
++#include <mach/mach_init.h>
++#include <mach/mach_port.h>
++#include <mach/mach_vm.h>
++#include <mach/vm_page_size.h>
++#include <mach/message.h>
++#include <mach/port.h>
++#include <mach/task.h>
++#include <mach/semaphore.h>
++#include <mach/mach_error.h>
++#include <servers/bootstrap.h>
++#include <os/lock.h>
++#include <AvailabilityMacros.h>
++#include <dlfcn.h>
++#include <sched.h>
++#include <unistd.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "wine/debug.h"
++#include "wine/server.h"
++
++#include "unix_private.h"
++#include "msync.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(sync);
++
++static LONGLONG update_timeout( ULONGLONG end )
++{
++    LARGE_INTEGER now;
++    LONGLONG timeleft;
++
++    NtQuerySystemTime( &now );
++    timeleft = end - now.QuadPart;
++    if (timeleft < 0) timeleft = 0;
++    return timeleft;
++}
++
++#define UL_COMPARE_AND_WAIT_SHARED  0x3
++#define ULF_WAKE_ALL                0x00000100
++#define ULF_NO_ERRNO                0x01000000
++extern int __ulock_wake( uint32_t operation, void *addr, uint64_t wake_value );
++extern int __ulock_wait( uint32_t operation, void *addr, uint64_t value, uint32_t timeout ); /* timeout is specified in microseconds */
++#ifdef MAC_OS_VERSION_11_0
++extern int __ulock_wait2( uint32_t operation, void *addr, uint64_t value, uint64_t timeout_ns, uint64_t value2 ) __attribute__((weak_import));
++#endif
++
++static inline int ulock_wait( uint32_t operation, void *addr, uint64_t value, uint64_t timeout_ns )
++{
++#ifdef MAC_OS_VERSION_11_0
++    if (__builtin_available( macOS 11.0, * ))
++    {
++        return __ulock_wait2( operation, addr, value, timeout_ns, 0 );
++    }
++    else
++#endif
++    {
++        uint32_t timeout_us = timeout_ns / 1000;
++        /* Avoid a 0 timeout for small timeout_ns values */
++        uint32_t adjust = (timeout_us == 0) & (timeout_ns != 0);
++        return __ulock_wait( operation, addr, value, timeout_us + adjust );
++    }
++}
++
++/*
++ * Faster to directly do the syscall and inline everything, taken and slightly adapted
++ * from xnu/libsyscall/mach/mach_msg.c
++ */
++
++#define LIBMACH_OPTIONS64 (MACH_SEND_INTERRUPT|MACH_RCV_INTERRUPT)
++#define MACH64_SEND_MQ_CALL 0x0000000400000000ull
++
++typedef mach_msg_return_t (*mach_msg2_trap_ptr_t)( void *data, uint64_t options,
++    uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port,
++    uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout );
++
++static mach_msg2_trap_ptr_t mach_msg2_trap;
++
++static inline mach_msg_return_t mach_msg2_internal( void *data, uint64_t option64, uint64_t msgh_bits_and_send_size,
++    uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout)
++{
++    mach_msg_return_t mr;
++
++    mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++             msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++             rcv_size_and_priority, timeout );
++
++    if (mr == MACH_MSG_SUCCESS)
++        return MACH_MSG_SUCCESS;
++
++    while (mr == MACH_SEND_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout );
++
++    while (mr == MACH_RCV_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size & 0xffffffffull,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout);
++
++    return mr;
++}
++
++static inline mach_msg_return_t mach_msg2( mach_msg_header_t *data, uint64_t option64,
++    mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_t rcv_name, uint64_t timeout,
++    uint32_t priority)
++{
++    mach_msg_base_t *base;
++    mach_msg_size_t descriptors;
++
++    if (!mach_msg2_trap)
++        return mach_msg( data, (mach_msg_option_t)option64, send_size,
++                         rcv_size, rcv_name, timeout, priority );
++
++    base = (mach_msg_base_t *)data;
++
++    if ((option64 & MACH_SEND_MSG) &&
++        (base->header.msgh_bits & MACH_MSGH_BITS_COMPLEX))
++        descriptors = base->body.msgh_descriptor_count;
++    else
++        descriptors = 0;
++
++#define MACH_MSG2_SHIFT_ARGS(lo, hi) ((uint64_t)hi << 32 | (uint32_t)lo)
++    return mach_msg2_internal(data, option64 | MACH64_SEND_MQ_CALL,
++               MACH_MSG2_SHIFT_ARGS(data->msgh_bits, send_size),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_remote_port, data->msgh_local_port),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_voucher_port, data->msgh_id),
++               MACH_MSG2_SHIFT_ARGS(descriptors, rcv_name),
++               MACH_MSG2_SHIFT_ARGS(rcv_size, priority), timeout);
++#undef MACH_MSG2_SHIFT_ARGS
++}
++
++struct semaphore
++{
++    int count;
++    int max;
++    unsigned short msync_type;
++    unsigned short refcount;
++    int multiple_waiters;
++};
++C_ASSERT(sizeof(struct semaphore) == 16);
++
++struct event
++{
++    int signaled;
++    int unused;
++    unsigned short msync_type;
++    unsigned short refcount;
++    int multiple_waiters;
++};
++C_ASSERT(sizeof(struct event) == 16);
++
++struct mutex
++{
++    int tid;
++    int count;  /* recursion count */
++    unsigned short msync_type;
++    unsigned short refcount;
++    int multiple_waiters;
++};
++C_ASSERT(sizeof(struct mutex) == 16);
++
++typedef struct
++{
++    mach_msg_header_t header;
++    unsigned int shm_idx[MAXIMUM_WAIT_OBJECTS + 1];
++} mach_register_message_t;
++
++static mach_port_t server_port;
++
++static int *shm_tid_map;
++
++static const mach_msg_bits_t msgh_bits_send = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
++
++static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, const int *objs,
++                                void **objs_shm, int alert_obj, void *alert_obj_shm, int count )
++{
++    int i, is_mutex;
++    mach_msg_return_t mr;
++    __thread static mach_register_message_t message;
++
++    message.header.msgh_remote_port = server_port;
++    message.header.msgh_bits = msgh_bits_send;
++    message.header.msgh_id = msgh_id;
++
++    for (i = 0; i < count; i++)
++    {
++        struct event *obj = (struct event *)objs_shm[i];
++
++        is_mutex = obj->msync_type == MSYNC_MUTEX ? 1 : 0;
++        message.shm_idx[i] = objs[i]| (is_mutex << 28);
++        __atomic_add_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
++    }
++
++    if (alert_obj)
++    {
++        struct event *obj = (struct event *)alert_obj_shm;
++
++        message.shm_idx[count++] = alert_obj;
++        __atomic_add_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
++    }
++
++    message.header.msgh_size = sizeof(mach_msg_header_t) +
++                               count * sizeof(unsigned int);
++
++    mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
++                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
++
++    if (mr != MACH_MSG_SUCCESS)
++        ERR("Failed to send server register wait: %#x\n", mr);
++
++    return mr;
++}
++
++static inline void server_remove_wait( unsigned int msgh_id, const int *objs, void **objs_shm,
++                                       int alert_obj, void *alert_obj_shm, int count )
++{
++    int i;
++    mach_msg_return_t mr;
++    __thread static mach_register_message_t message;
++
++    message.header.msgh_remote_port = server_port;
++    message.header.msgh_bits = msgh_bits_send;
++    message.header.msgh_id = msgh_id;
++
++    for (i = 0; i < count; i++)
++    {
++        struct event *obj = (struct event *)objs_shm[i];
++
++        int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
++        if (refs < 0)
++            __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
++        message.shm_idx[i] = objs[i];
++    }
++
++    if (alert_obj)
++    {
++        struct event *obj = (struct event *)alert_obj_shm;
++
++        int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
++        if (refs < 0)
++            __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
++        message.shm_idx[count++] = alert_obj;
++    }
++
++    message.shm_idx[0] |= (1 << 29);
++
++    message.header.msgh_size = sizeof(mach_msg_header_t) +
++                               count * sizeof(unsigned int);
++
++    mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
++                     0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
++
++    if (mr != MACH_MSG_SUCCESS)
++        ERR("Failed to send server remove wait: %#x\n", mr);
++}
++
++static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
++                                          ULONGLONG *end, int tid )
++{
++    int ret, val = 0;
++    ULONGLONG ns_timeleft = 0;
++
++    do 
++    {
++        if (((struct mutex *)obj_shm)->msync_type == MSYNC_MUTEX)
++        {
++            val = __atomic_load_n( (int *)obj_shm, __ATOMIC_ACQUIRE );
++            if (!val || val == ~0)
++                val = tid;
++        }
++
++        if (__atomic_load_n( (int *)obj_shm, __ATOMIC_ACQUIRE ) != val)
++            return STATUS_PENDING;
++
++        if (end)
++        {
++            ns_timeleft = update_timeout( *end ) * 100;
++            if (!ns_timeleft) return STATUS_TIMEOUT;
++        }
++        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, obj_shm, val, ns_timeleft );
++    } while (ret == -EINTR || ret == -EFAULT);
++
++    if (ret == -ETIMEDOUT)
++        return STATUS_TIMEOUT;
++
++    return STATUS_SUCCESS;
++}
++
++static inline int check_shm_contention( void **objs_shm, void *alert_obj_shm, int count, int tid )
++{
++    int i, val;
++
++    for (i = 0; i < count; i++)
++    {
++        val = __atomic_load_n((int *)objs_shm[i], __ATOMIC_SEQ_CST);
++        if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
++        {
++            if (val == 0 || val == ~0 || val == tid) return 1;
++        }
++        else
++        {
++            if (val != 0)  return 1;
++        }
++    }
++
++    if (alert_obj_shm)
++    {
++        val = __atomic_load_n((int *)alert_obj_shm, __ATOMIC_SEQ_CST);
++        if (val != 0)  return 1;
++    }
++
++    return 0;
++}
++
++static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert_obj, void *alert_obj_shm,
++                                     int count, ULONGLONG *end, int tid )
++{
++    int ret, val;
++    int *addr = shm_tid_map + tid;
++    ULONGLONG ns_timeleft = 0;
++    mach_msg_return_t mr;
++    unsigned int msgh_id;
++    int total_count = count + (alert_obj ? 1 : 0);
++
++    __atomic_store_n( addr, 2, __ATOMIC_RELEASE );
++    msgh_id = (tid << 8) | total_count;
++    mr = server_register_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
++
++    if (mr != MACH_MSG_SUCCESS)
++        return STATUS_PENDING;
++
++    while (__atomic_load_n( addr, __ATOMIC_ACQUIRE ) == 2)
++    {
++        if (check_shm_contention( objs_shm, alert_obj_shm, count, tid ))
++        {
++            int i;
++            for (i = 0; i < count; i++)
++            {
++                struct event *obj = (struct event *)objs_shm[i];
++
++                int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
++                if (refs < 0)
++                    __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
++            }
++            return STATUS_PENDING;
++        }
++    }
++
++    do
++    {
++        if (end)
++        {
++            ns_timeleft = update_timeout( *end ) * 100;
++            if (!ns_timeleft)
++            {
++                server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
++                return STATUS_TIMEOUT;
++            }
++        }
++        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, 1, ns_timeleft );
++        val = __atomic_load_n( addr, __ATOMIC_ACQUIRE );
++        if (!val)
++            break;
++    } while (ret == -EINTR || ret == -EFAULT);
++
++    server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
++
++    if (ret == -ETIMEDOUT) return STATUS_TIMEOUT;
++
++    return STATUS_SUCCESS;
++}
++
++int do_msync(void)
++{
++    static int do_msync_cached = -1;
++
++    if (do_msync_cached == -1)
++        do_msync_cached = getenv("WINEMSYNC") && atoi(getenv("WINEMSYNC"));
++
++    return do_msync_cached;
++}
++
++static const mach_vm_size_t shm_tid_size = 64 * 1024 * 1024; /* 64 MB to index 24 bit tids */
++static void **shm_addrs;
++static int shm_addrs_size;  /* length of the allocated shm_addrs array */
++static long pagesize;
++
++typedef struct
++{
++    mach_msg_header_t header;
++    int entry;
++} mach_map_message_t;
++
++typedef struct
++{
++    mach_msg_header_t header;
++    mach_msg_body_t body;
++    mach_msg_port_descriptor_t descriptor;
++    mach_msg_trailer_t trailer;
++} mach_map_message_reply_t;
++
++static void *request_shm_from_server( int entry, int tid )
++{
++    static __thread mach_map_message_t send_message;
++    static __thread mach_map_message_reply_t receive_message;
++    mach_msg_return_t mr;
++    kern_return_t kr;
++    mach_port_t reply_port;
++    mach_vm_address_t map_address = 0;
++
++    TRACE( "requesting shm entry %d from server\n", entry );
++
++    kr = mach_port_allocate( mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &reply_port );
++
++    if (kr != KERN_SUCCESS)
++    {
++        ERR( "Failed to allocate reply port: %s\n", mach_error_string( kr ) );
++        return NULL;
++    }
++
++    kr = mach_port_insert_right( mach_task_self(), reply_port, reply_port, MACH_MSG_TYPE_MAKE_SEND );
++
++    if (kr != KERN_SUCCESS)
++    {
++        ERR( "Failed to insert right into reply port: %s\n", mach_error_string( kr ) );
++        mach_port_deallocate( mach_task_self(), reply_port );
++        return NULL;
++    }
++
++    send_message.header.msgh_bits = MACH_MSGH_BITS_SET( MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_COPY_SEND, 0, 0 );
++    send_message.header.msgh_id = tid;
++    send_message.header.msgh_size = sizeof(send_message);
++    send_message.header.msgh_remote_port = server_port;
++    send_message.header.msgh_local_port = reply_port;
++    send_message.entry = entry;
++
++    mr = mach_msg_overwrite( &send_message.header, MACH_SEND_MSG | MACH_RCV_MSG,
++               send_message.header.msgh_size, sizeof(receive_message), reply_port,
++               MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL, &receive_message.header, 0 );
++
++    if (mr != MACH_MSG_SUCCESS)
++    {
++        ERR( "Failed to send/receive shm map request: %#x\n", mr );
++    }
++    else
++    {
++        mach_vm_size_t size = tid ? shm_tid_size : pagesize;
++
++        TRACE( "mapping shm entry %u with size %llu\n", receive_message.descriptor.name, size );
++
++        kr = mach_vm_map( mach_task_self(), &map_address, size, 0, VM_FLAGS_ANYWHERE,
++                          receive_message.descriptor.name, 0, FALSE, VM_PROT_DEFAULT,
++                          VM_PROT_DEFAULT, VM_INHERIT_NONE );
++
++        if (kr != KERN_SUCCESS)
++        {
++            ERR( "Failed to map shm entry: %u: %d (%s)\n", receive_message.descriptor.name, kr, mach_error_string( kr ) );
++            map_address = 0;
++        }
++    }
++
++    mach_port_deallocate( mach_task_self(), reply_port );
++    mach_port_deallocate( mach_task_self(), receive_message.descriptor.name );
++    return (void *)map_address;
++}
++
++static os_unfair_lock shm_addrs_lock = OS_UNFAIR_LOCK_INIT;
++
++static void *get_shm_slow( unsigned int idx )
++{
++    int entry  = (idx * 16) / pagesize;
++    int offset = (idx * 16) % pagesize;
++    void *ret;
++
++    os_unfair_lock_lock( &shm_addrs_lock );
++
++    if (entry >= shm_addrs_size)
++    {
++        int new_size = max(shm_addrs_size * 2, entry + 1);
++
++        if (!(shm_addrs = realloc( shm_addrs, new_size * sizeof(shm_addrs[0]) )))
++            ERR("Failed to grow shm_addrs array to size %d.\n", shm_addrs_size);
++        memset( shm_addrs + shm_addrs_size, 0, (new_size - shm_addrs_size) * sizeof(shm_addrs[0]) );
++        shm_addrs_size = new_size;
++    }
++
++    if (!shm_addrs[entry])
++    {
++        void *addr = request_shm_from_server( entry, 0 );
++        if (!addr)
++            ERR("Failed to map page %d (offset %#lx).\n", entry, entry * pagesize);
++
++        TRACE("Mapping page %d at %p.\n", entry, addr);
++
++        if (__sync_val_compare_and_swap( &shm_addrs[entry], 0, addr ))
++            mach_vm_deallocate( mach_task_self(), (mach_vm_address_t)addr, pagesize ); /* someone beat us to it */
++    }
++
++    ret = (void *)((unsigned long)shm_addrs[entry] + offset);
++
++    os_unfair_lock_unlock( &shm_addrs_lock );
++
++    return ret;
++}
++
++static inline void *get_shm( const unsigned int idx )
++{
++    int entry = idx >> (vm_kernel_page_shift - 4);
++    int offset = (idx << 4) & vm_kernel_page_mask;
++
++    if (entry >= shm_addrs_size || !shm_addrs[entry])
++        return get_shm_slow( idx );
++
++    return (void *)((unsigned long)shm_addrs[entry] + offset);
++}
++
++void msync_close( int obj )
++{
++    static __thread mach_msg_header_t send_header;
++    mach_msg_return_t mr;
++
++    TRACE( "obj=%d.\n", obj );
++
++    send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
++    send_header.msgh_id = obj | (1 << 28);
++    send_header.msgh_size = sizeof(send_header);
++    send_header.msgh_remote_port = server_port;
++
++    mr = mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
++                    0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
++
++    if (mr != MACH_MSG_SUCCESS)
++        ERR( "Failed to send message to server to close msync object %d: %#x\n", obj, mr );
++}
++
++void msync_init(void)
++{
++    struct stat st;
++    mach_port_t bootstrap_port;
++    void *dlhandle = dlopen( NULL, RTLD_NOW );
++    char message_port_name[28];
++
++    if (!do_msync())
++    {
++        /* make sure the server isn't running with WINEMSYNC */
++        NTSTATUS ret;
++
++        SERVER_START_REQ( get_inproc_alert_fd )
++        {
++            ret = wine_server_call( req );
++        }
++        SERVER_END_REQ;
++
++        if (ret != STATUS_INVALID_PARAMETER)
++        {
++            ERR("Server is running with WINEMSYNC but this process is not, please enable WINEMSYNC or restart wineserver.\n");
++            exit(1);
++        }
++
++        dlclose( dlhandle );
++        return;
++    }
++
++    if (stat( config_dir, &st ) == -1)
++        ERR("Cannot stat %s\n", config_dir);
++
++    if (st.st_ino != (unsigned long)st.st_ino)
++        snprintf( message_port_name, 28, "wine-%lx%08lx-msync", (unsigned long)((unsigned long long)st.st_ino >> 32), (unsigned long)st.st_ino );
++    else
++        snprintf( message_port_name, 28, "wine-%lx-msync", (unsigned long)st.st_ino );
++
++    pagesize = (long)vm_kernel_page_size;
++
++    shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
++    shm_addrs_size = 128;
++
++    /* Bootstrap mach wineserver communication */
++
++    mach_msg2_trap = (mach_msg2_trap_ptr_t)dlsym( dlhandle, "mach_msg2_trap" );
++    if (!mach_msg2_trap)
++        WARN("Using mach_msg instead of mach_msg2\n");
++    dlclose( dlhandle );
++
++    if (task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bootstrap_port) != KERN_SUCCESS)
++    {
++        ERR("Failed task_get_special_port\n");
++        exit(1);
++    }
++
++    if (bootstrap_look_up(bootstrap_port, message_port_name, &server_port) != KERN_SUCCESS)
++    {
++        ERR("Failed bootstrap_look_up for %s\n", message_port_name);
++        exit(1);
++    }
++
++    shm_tid_map = request_shm_from_server( 0, 1 );
++
++    if (!shm_tid_map)
++    {
++        ERR("Failed to map tid shared memory");
++        exit(1);
++    }
++}
++
++static inline void signal_all( void *shm, unsigned int shm_idx )
++{
++    __thread static mach_msg_header_t send_header;
++    struct event *event_obj = (struct event *)shm;
++
++    __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, shm, 0 );
++
++    if (!__atomic_load_n( &event_obj->multiple_waiters, __ATOMIC_SEQ_CST ))
++        return;
++
++    send_header.msgh_bits = msgh_bits_send;
++    send_header.msgh_id = shm_idx;
++    send_header.msgh_size = sizeof(send_header);
++    send_header.msgh_remote_port = server_port;
++
++    mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size, 0,
++               MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
++}
++
++NTSTATUS msync_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
++{
++    struct semaphore *semaphore = get_shm( obj );
++    ULONG current;
++
++    do
++    {
++        current = semaphore->count;
++        if (count + current > semaphore->max)
++            return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
++
++    } while (__sync_val_compare_and_swap( &semaphore->count, current, count + current ) != current);
++
++    if (prev_count) *prev_count = current;
++
++    signal_all( (void *)semaphore, obj );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS msync_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info )
++{
++    struct semaphore *semaphore = get_shm( obj );
++
++    info->CurrentCount = semaphore->count;
++    info->MaximumCount = semaphore->max;
++
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS msync_set_event_obj( int obj, LONG *prev_state )
++{
++    struct event *event = get_shm( obj );
++    LONG current;
++
++    if (!(current = __atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST )))
++        signal_all( (void *)event, obj );
++
++    if (prev_state) *prev_state = current;
++
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS msync_reset_event_obj( int obj, LONG *prev_state )
++{
++    struct event *event = get_shm( obj );
++    LONG current;
++
++    current = __atomic_exchange_n( &event->signaled, 0, __ATOMIC_SEQ_CST );
++
++    if (prev_state) *prev_state = current;
++
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS msync_pulse_event_obj( int obj, LONG *prev_state )
++{
++    struct event *event = get_shm( obj );
++    LONG current;
++
++    /* This isn't really correct; an application could miss the write.
++     * Unfortunately we can't really do much better. Fortunately this is rarely
++     * used (and publicly deprecated). */
++    if (!(current = __atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST )))
++        signal_all( (void *)event, obj );
++
++    /* Try to give other threads a chance to wake up. Hopefully erring on this
++     * side is the better thing to do... */
++    sched_yield();
++
++    __atomic_store_n( &event->signaled, 0, __ATOMIC_SEQ_CST );
++
++    if (prev_state) *prev_state = current;
++
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS msync_query_event_obj( int obj, EVENT_BASIC_INFORMATION *info )
++{
++    struct event *event = get_shm( obj );
++
++    info->EventState = event->signaled;
++    info->EventType = (event->msync_type == MSYNC_AUTO_EVENT ? SynchronizationEvent : NotificationEvent);
++
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS msync_release_mutex_obj( int obj, LONG *prev_count )
++{
++    struct mutex *mutex = get_shm( obj );
++
++    if (mutex->tid != GetCurrentThreadId())
++        return STATUS_MUTANT_NOT_OWNED;
++
++    if (prev_count) *prev_count = mutex->count;
++
++    if (!--mutex->count)
++    {
++        __atomic_store_n( &mutex->tid, 0, __ATOMIC_SEQ_CST );
++        signal_all( (void *)mutex, obj );
++    }
++
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS msync_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
++{
++    struct mutex *mutex = get_shm( obj );
++
++    info->CurrentCount = 1 - mutex->count;
++    info->OwnedByCaller = (mutex->tid == GetCurrentThreadId());
++    info->AbandonedState = (mutex->tid == ~0);
++
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS do_single_wait( int obj, void *obj_shm, int alert_obj, void *alert_obj_shm, ULONGLONG *end, int tid )
++{
++    NTSTATUS status;
++
++    if (alert_obj)
++    {
++        if (__atomic_load_n( (int *)alert_obj_shm, __ATOMIC_SEQ_CST ))
++            return STATUS_USER_APC;
++
++        status = msync_wait_multiple( &obj, &obj_shm, alert_obj, alert_obj_shm, 1, end, tid );
++
++        if (__atomic_load_n( (int *)alert_obj_shm, __ATOMIC_SEQ_CST ))
++            return STATUS_USER_APC;
++    }
++    else
++    {
++        status = msync_wait_single( obj, obj_shm, end, tid );
++    }
++    return status;
++}
++
++NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
++                          int alert_obj, const LARGE_INTEGER *timeout )
++{
++    static const LARGE_INTEGER zero = {0};
++
++    int current_tid = 0;
++    static __thread void *objs_shm[MAXIMUM_WAIT_OBJECTS];
++    int *alert_obj_shm = NULL;
++    LARGE_INTEGER now;
++    int single_wait = 0;
++    ULONGLONG end;
++    int i, ret;
++
++    current_tid = GetCurrentThreadId();
++
++    if (alert_obj)
++    {
++        alert_obj_shm = get_shm( alert_obj );
++        if (!count) single_wait = 1;
++    }
++    else
++    {
++        if (count == 1) single_wait = 1;
++    }
++
++    NtQuerySystemTime( &now );
++    if (timeout)
++    {
++        if (timeout->QuadPart == TIMEOUT_INFINITE)
++            timeout = NULL;
++        else if (timeout->QuadPart > 0)
++            end = timeout->QuadPart;
++        else
++            end = now.QuadPart - timeout->QuadPart;
++    }
++
++    for (i = 0; i < count; i++)
++        objs_shm[i] = (struct event *)get_shm( objs[i] );
++
++    if (wait_any || count <= 1)
++    {
++        while (1)
++        {
++            /* Try to grab anything. */
++
++            if (alert_obj)
++            {
++                /* We must check this first! The server may set an event that
++                 * we're waiting on, but we need to return STATUS_USER_APC. */
++                if (__atomic_load_n( alert_obj_shm, __ATOMIC_SEQ_CST ))
++                    goto userapc;
++            }
++
++            for (i = 0; i < count; i++)
++            {
++                switch (((struct event *)objs_shm[i])->msync_type)
++                {
++                case MSYNC_SEMAPHORE:
++                {
++                    struct semaphore *semaphore = objs_shm[i];
++                    int current, new;
++
++                    new = __atomic_load_n( &semaphore->count, __ATOMIC_SEQ_CST );
++                    while ((current = new))
++                    {
++                        if ((new = __sync_val_compare_and_swap( &semaphore->count, current, current - 1 )) == current)
++                            return i;
++                    }
++                    break;
++                }
++                case MSYNC_MUTEX:
++                {
++                    struct mutex *mutex = objs_shm[i];
++                    int tid;
++
++                    if (mutex->tid == current_tid)
++                    {
++                        mutex->count++;
++                        return i;
++                    }
++
++                    tid = 0;
++                    if (__atomic_compare_exchange_n(&mutex->tid, &tid, current_tid, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
++                    {
++                        mutex->count = 1;
++                        return i;
++                    }
++                    else if (tid == ~0 && __atomic_compare_exchange_n(&mutex->tid, &tid, current_tid, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
++                    {
++                        mutex->count = 1;
++                        return STATUS_ABANDONED_WAIT_0 + i;
++                    }
++
++                    break;
++                }
++                case MSYNC_AUTO_EVENT:
++                case MSYNC_AUTO_SERVER:
++                {
++                    struct event *event = objs_shm[i];
++                    int signaled = 1;
++
++                    if (__atomic_compare_exchange_n(&event->signaled, &signaled, 0, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
++                        return i;
++
++                    break;
++                }
++                case MSYNC_MANUAL_EVENT:
++                case MSYNC_MANUAL_SERVER:
++                {
++                    struct event *event = objs_shm[i];
++
++                    if (__atomic_load_n(&event->signaled, __ATOMIC_SEQ_CST))
++                        return i;
++
++                    break;
++                }
++                default:
++                    ERR("Invalid type %#x for obj %d.\n", ((struct event *)objs_shm[i])->msync_type, objs[i]);
++                    assert(0);
++                }
++            }
++
++            /* Looks like everything is contended, so wait. */
++
++            if (timeout && !timeout->QuadPart)
++            {
++                /* Unlike esync, we already know that we've timed out, so we
++                 * can avoid a syscall. */
++                return STATUS_TIMEOUT;
++            }
++
++            if (alert_obj && single_wait)
++                ret = msync_wait_single( alert_obj, alert_obj_shm, timeout ? &end : NULL, current_tid );
++            else if (single_wait)
++                ret = msync_wait_single( objs[0], objs_shm[0], timeout ? &end : NULL, current_tid );
++            else
++                ret = msync_wait_multiple( objs, objs_shm, alert_obj, alert_obj_shm, count, timeout ? &end : NULL, current_tid );
++
++            if (ret == STATUS_TIMEOUT) return STATUS_TIMEOUT;
++        } /* while (1) */
++    }
++    else
++    {
++        /* Wait-all is a little trickier to implement correctly. Fortunately,
++         * it's not as common.
++         *
++         * The idea is basically just to wait in sequence on every object in the
++         * set. Then when we're done, try to grab them all in a tight loop. If
++         * that fails, release any resources we've grabbed (and yes, we can
++         * reliably do this—it's just mutexes and semaphores that we have to
++         * put back, and in both cases we just put back 1), and if any of that
++         * fails we start over.
++         *
++         * What makes this inherently bad is that we might temporarily grab a
++         * resource incorrectly. Hopefully it'll be quick (and hey, it won't
++         * block on wineserver) so nobody will notice. Besides, consider: if
++         * object A becomes signaled but someone grabs it before we can grab it
++         * and everything else, then they could just as well have grabbed it
++         * before it became signaled. Similarly if object A was signaled and we
++         * were blocking on object B, then B becomes available and someone grabs
++         * A before we can, then they might have grabbed A before B became
++         * signaled. In either case anyone who tries to wait on A or B will be
++         * waiting for an instant while we put things back. */
++
++        NTSTATUS status = STATUS_SUCCESS;
++
++        while (1)
++        {
++            BOOL abandoned;
++
++tryagain:
++            abandoned = FALSE;
++
++            /* First step: try to wait on each object in sequence. */
++
++            for (i = 0; i < count; i++)
++            {
++                if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
++                {
++                    struct mutex *mutex = (struct mutex *)objs_shm[i];
++
++                    if (mutex->tid == current_tid)
++                        continue;
++
++                    while (__atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST ))
++                    {
++                        status = do_single_wait( objs[i], objs_shm[i], alert_obj, alert_obj_shm, timeout ? &end : NULL, current_tid );
++                        if (status != STATUS_PENDING)
++                            break;
++                    }
++                }
++                else
++                {
++                    /* this works for semaphores too */
++                    struct event *event = (struct event *)objs_shm[i];
++
++                    while (!__atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST ))
++                    {
++                        status = do_single_wait( objs[i], objs_shm[i], alert_obj, alert_obj_shm, timeout ? &end : NULL, current_tid );
++                        if (status != STATUS_PENDING)
++                            break;
++                    }
++                }
++
++                if (status == STATUS_TIMEOUT) return STATUS_TIMEOUT;
++                if (status == STATUS_USER_APC) goto userapc;
++            }
++
++            /* If we got here and we haven't timed out, that means all of the
++             * handles were signaled. Check to make sure they still are. */
++            for (i = 0; i < count; i++)
++            {
++
++                if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
++                {
++                    struct mutex *mutex = (struct mutex *)objs_shm[i];
++                    int tid = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST );
++
++                    if (tid && tid != ~0 && tid != current_tid)
++                        goto tryagain;
++                }
++                else
++                {
++                    struct event *event = (struct event *)objs_shm[i];
++
++                    if (!__atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST ))
++                        goto tryagain;
++                }
++            }
++
++            /* Yep, still signaled. Now quick, grab everything. */
++            for (i = 0; i < count; i++)
++            {
++                switch (((struct event *)objs_shm[i])->msync_type)
++                {
++                case MSYNC_MUTEX:
++                {
++                    struct mutex *mutex = (struct mutex *)objs_shm[i];
++                    int tid = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST );
++                    if (tid == current_tid)
++                        break;
++                    if (tid && tid != ~0)
++                        goto tooslow;
++                    if (__sync_val_compare_and_swap( &mutex->tid, tid, current_tid ) != tid)
++                        goto tooslow;
++                    if (tid == ~0)
++                        abandoned = TRUE;
++                    break;
++                }
++                case MSYNC_SEMAPHORE:
++                {
++                    struct semaphore *semaphore = (struct semaphore *)objs_shm[i];
++                    int current, new;
++
++                    new = __atomic_load_n( &semaphore->count, __ATOMIC_SEQ_CST );
++                    while ((current = new))
++                    {
++                        if ((new = __sync_val_compare_and_swap( &semaphore->count, current, current - 1 )) == current)
++                            break;
++                    }
++                    if (!current)
++                        goto tooslow;
++                    break;
++                }
++                case MSYNC_AUTO_EVENT:
++                case MSYNC_AUTO_SERVER:
++                {
++                    struct event *event = (struct event *)objs_shm[i];
++                    if (!__sync_val_compare_and_swap( &event->signaled, 1, 0 ))
++                        goto tooslow;
++                    break;
++                }
++                default:
++                    /* If a manual-reset event changed between there and
++                     * here, it's shouldn't be a problem. */
++                    break;
++                }
++            }
++
++            /* If we got here, we successfully waited on every object.
++             * Make sure to let ourselves know that we grabbed the mutexes. */
++            for (i = 0; i < count; i++)
++            {
++                if (((struct mutex *)objs_shm[i])->msync_type == MSYNC_MUTEX)
++                {
++                    struct mutex *mutex = (struct mutex *)objs_shm[i];
++                    mutex->count++;
++                }
++            }
++
++            if (abandoned) return STATUS_ABANDONED;
++
++            return STATUS_SUCCESS;
++
++tooslow:
++            for (--i; i >= 0; i--)
++            {
++                switch (((struct event *)objs_shm[i])->msync_type)
++                {
++                case MSYNC_MUTEX:
++                {
++                    struct mutex *mutex = (struct mutex *)objs_shm[i];
++                    /* HACK: This won't do the right thing with abandoned
++                     * mutexes, but fixing it is probably more trouble than
++                     * it's worth. */
++                    __atomic_store_n( &mutex->tid, 0, __ATOMIC_SEQ_CST );
++                    break;
++                }
++                case MSYNC_SEMAPHORE:
++                {
++                    struct semaphore *semaphore = (struct semaphore *)objs_shm[i];
++                    __sync_fetch_and_add( &semaphore->count, 1 );
++                    break;
++                }
++                case MSYNC_AUTO_EVENT:
++                case MSYNC_AUTO_SERVER:
++                {
++                    struct event *event = (struct event *)objs_shm[i];
++                    __atomic_store_n( &event->signaled, 1, __ATOMIC_SEQ_CST );
++                    break;
++                }
++                default:
++                    /* doesn't need to be put back */
++                    break;
++                }
++            }
++        } /* while (1) */
++    } /* else (wait-all) */
++
++    assert(0);  /* shouldn't reach here... */
++
++userapc:
++    /* We have to make a server call anyway to get the APC to execute, so just
++     * delegate down to server_wait(). */
++    ret = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, &zero );
++
++    /* This can happen if we received a system APC, and the APC fd was woken up
++     * before we got SIGUSR1. poll() doesn't return EINTR in that case. The
++     * right thing to do seems to be to return STATUS_USER_APC anyway. */
++    if (ret == STATUS_TIMEOUT) ret = STATUS_USER_APC;
++    return ret;
++}
++
++#else /* __APPLE__ */
++
++int do_msync(void)
++{
++    return 0;
++}
++
++void msync_init(void)
++{
++}
++
++void msync_close( int obj )
++{
++}
++
++#endif /* __APPLE__ */
+diff --git a/dlls/ntdll/unix/msync.h b/dlls/ntdll/unix/msync.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..43af926c63d1ebc02c233c5c9d65d464bb762a14
+--- /dev/null
++++ b/dlls/ntdll/unix/msync.h
+@@ -0,0 +1,49 @@
++/*
++ * mach semaphore-based synchronization objects
++ *
++ * Copyright (C) 2018 Zebediah Figura
++ * Copyright (C) 2023 Marc-Aurel Zent
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++extern int do_msync(void);
++extern void msync_init(void);
++extern void msync_close( int obj );
++
++#ifdef __APPLE__
++
++enum msync_type
++{
++    MSYNC_SEMAPHORE = 1,
++    MSYNC_AUTO_EVENT,
++    MSYNC_MANUAL_EVENT,
++    MSYNC_MUTEX,
++    MSYNC_AUTO_SERVER,
++    MSYNC_MANUAL_SERVER,
++};
++
++extern NTSTATUS msync_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count );
++extern NTSTATUS msync_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info );
++extern NTSTATUS msync_set_event_obj( int obj, LONG *prev_state );
++extern NTSTATUS msync_reset_event_obj( int obj, LONG *prev_state );
++extern NTSTATUS msync_pulse_event_obj( int obj, LONG *prev_state );
++extern NTSTATUS msync_query_event_obj( int obj, EVENT_BASIC_INFORMATION *info );
++extern NTSTATUS msync_release_mutex_obj( int obj, LONG *prev_count );
++extern NTSTATUS msync_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info );
++extern NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
++                                 int alert_obj, const LARGE_INTEGER *timeout );
++
++#endif /* __APPLE__ */
+diff --git a/dlls/ntdll/unix/signal_x86_64.c b/dlls/ntdll/unix/signal_x86_64.c
+index e612e5e0d3eecf62692ebdfcea4862d6f28ae09f..e1e4872936234c60c1c16b7017c3c9a1839d5341 100644
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -89,6 +89,15 @@ WINE_DECLARE_DEBUG_CHANNEL(seh);
+ 
+ #include "dwarf.h"
+ 
++#ifdef __APPLE__
++/* CW Hack 24256 */
++#include <sys/sysctl.h>
++static BOOL is_rosetta2;
++
++/* CW Hack 23427 */
++static BOOL sequoia_or_later = FALSE;
++#endif
++
+ static USHORT cs32_sel;  /* selector for %cs in 32-bit mode */
+ static USHORT cs64_sel;  /* selector for %cs in 64-bit mode */
+ static USHORT ds64_sel;  /* selector for %ds/%es/%ss in 64-bit mode */
+@@ -823,9 +832,8 @@ static inline void leave_handler( struct thread_data *data, ucontext_t *sigconte
+         if (fs32_sel) __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
+     }
+ #elif defined __APPLE__
+-    if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
+-        !is_inside_syscall( data, RSP_sig(sigcontext )))
+-        _thread_set_tsd_base( (uint64_t)data->teb );
++    /* CX Apple GS overlay: GSBASE stays pthread; TEB Self/TLS/Peb are mirrored
++     * into pthread TLS slots. Do not _thread_set_tsd_base(teb). */
+ #endif
+     if (is_16bit( sigcontext )) return;
+ #ifdef DS_sig
+@@ -894,6 +902,13 @@ static void save_context( struct thread_data *data, struct xcontext *xcontext,
+ 
+         context->ContextFlags |= CONTEXT_FLOATING_POINT;
+         memcpy( &context->FltSave, FPU_sig(sigcontext), sizeof(context->FltSave) );
++#ifdef __APPLE__
++        /* CW Hack 24256: mxcsr in signal contexts is incorrect in Rosetta.
++           In Rosetta only, the actual value of the register from within the
++           handler is correct (on Intel it has some default value). */
++        if (is_rosetta2)
++            __asm__ volatile( "stmxcsr %0" : "=m" (context->FltSave.MxCsr) );
++#endif
+         context->MxCsr = context->FltSave.MxCsr;
+         if (xstate_extended_features && (xs = XState_sig(FPU_sig(sigcontext))))
+         {
+@@ -1682,13 +1697,6 @@ __ASM_GLOBAL_FUNC( call_user_mode_callback,
+                    "jz 1f\n\t"
+                    "movw %ax,%fs\n"
+                    "1:\n\t"
+-#elif defined __APPLE__
+-                   "movq %rcx,%r10\n\t"
+-                   "movq %r13,%rdi\n\t"
+-                   "xorl %esi,%esi\n\t"
+-                   "movl $0x3000003,%eax\n\t"  /* _thread_set_tsd_base */
+-                   "syscall\n\t"
+-                   "movq %r10,%rcx\n\t"
+ #endif
+                    "movq 0x330(%r13),%r10\n\t" /* amd64_thread_data()->instrumentation_callback */
+                    "movq (%r10),%r10\n\t"
+@@ -1808,6 +1816,154 @@ NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status
+     user_mode_callback_return( ret_ptr, ret_len, status, data->teb );
+ }
+ 
++#ifdef __APPLE__
++/***********************************************************************
++ *           handle_cet_nop
++ *
++ * Check if the fault location is an Intel CET instruction that should be treated as a NOP.
++ * Rosetta on Big Sur throws an exception for this, but is fixed in Monterey.
++ * CW HACK 20186
++ */
++static inline BOOL handle_cet_nop( ucontext_t *sigcontext, CONTEXT *context )
++{
++    BYTE instr[16];
++    unsigned int i, prefix_count = 0;
++    unsigned int len = virtual_uninterrupted_read_memory( (BYTE *)context->Rip, instr, sizeof(instr) );
++
++    for (i = 0; i < len; i++) switch (instr[i])
++    {
++    /* instruction prefixes */
++    case 0x2e:  /* %cs: */
++    case 0x36:  /* %ss: */
++    case 0x3e:  /* %ds: */
++    case 0x26:  /* %es: */
++    case 0x40:  /* rex */
++    case 0x41:  /* rex */
++    case 0x42:  /* rex */
++    case 0x43:  /* rex */
++    case 0x44:  /* rex */
++    case 0x45:  /* rex */
++    case 0x46:  /* rex */
++    case 0x47:  /* rex */
++    case 0x48:  /* rex */
++    case 0x49:  /* rex */
++    case 0x4a:  /* rex */
++    case 0x4b:  /* rex */
++    case 0x4c:  /* rex */
++    case 0x4d:  /* rex */
++    case 0x4e:  /* rex */
++    case 0x4f:  /* rex */
++    case 0x64:  /* %fs: */
++    case 0x65:  /* %gs: */
++    case 0x66:  /* opcode size */
++    case 0x67:  /* addr size */
++    case 0xf0:  /* lock */
++    case 0xf2:  /* repne */
++    case 0xf3:  /* repe */
++        if (++prefix_count >= 15) return FALSE;
++        continue;
++
++    case 0x0f: /* extended instruction */
++        if (i == len - 1) return 0;
++        switch (instr[i + 1])
++        {
++        case 0x1E:
++            /* RDSSPD/RDSSPQ: (prefixes) 0F 1E (modrm) */
++            RIP_sig(sigcontext) += prefix_count + 3;
++            TRACE_(seh)( "skipped RDSSPD/RDSSPQ instruction\n" );
++            return TRUE;
++        }
++        break;
++    default:
++        return FALSE;
++    }
++    return FALSE;
++}
++
++
++/***********************************************************************
++ *           emulate_xgetbv
++ *
++ * Check if the fault location is an Intel XGETBV instruction for xcr0 and
++ * emulate it if so. Actual Intel hardware supports this instruction, so this
++ * will only take effect under Rosetta.
++ * CW HACK 23427
++ */
++static inline BOOL emulate_xgetbv( ucontext_t *sigcontext, CONTEXT *context )
++{
++    BYTE instr[3];
++    unsigned int len = virtual_uninterrupted_read_memory( (BYTE *)context->Rip, instr, sizeof(instr) );
++
++    /* Prefixed xgetbv is illegal, so no need to check. */
++    if (len < 3 || instr[0] != 0x0f || instr[1] != 0x01 || instr[2] != 0xd0 ||
++        (RCX_sig(sigcontext) & 0xffffffff) != 0 /* only handling xcr0 (ecx==0) */)
++    {
++        return FALSE;
++    }
++
++    RDX_sig(sigcontext) = 0;
++    if (sequoia_or_later)
++    {
++        /* Arguably we should only claim AVX support if ROSETTA_ADVERTISE_AVX is
++           set, but presumably apps will also check cpuid. */
++        RAX_sig(sigcontext) = 0xe7;  /* fpu/mmx, sse, avx, full avx-512 */
++    }
++    else
++        RAX_sig(sigcontext) = 0x07;  /* fpu/mmx, sse */
++
++    RIP_sig(sigcontext) += 3;
++    TRACE_(seh)( "emulated an XGETBV instruction\n" );
++    return TRUE;
++}
++
++/***********************************************************************
++ *           handle_fndisi
++ *
++ * Check if the fault location is an x87 FNDISI instruction that should be treated as a NOP.
++ */
++static inline BOOL handle_fndisi( ucontext_t *sigcontext, CONTEXT *context )
++{
++    BYTE instr[16];
++    unsigned int i, prefix_count = 0;
++    unsigned int len = virtual_uninterrupted_read_memory( (BYTE *)context->Rip, instr, sizeof(instr) );
++
++    for (i = 0; i < len; i++) switch (instr[i])
++    {
++    /* instruction prefixes */
++    case 0x2e:  /* %cs: */
++    case 0x36:  /* %ss: */
++    case 0x3e:  /* %ds: */
++    case 0x26:  /* %es: */
++    case 0x40: case 0x41: case 0x42: case 0x43:
++    case 0x44: case 0x45: case 0x46: case 0x47:
++    case 0x48: case 0x49: case 0x4a: case 0x4b:
++    case 0x4c: case 0x4d: case 0x4e: case 0x4f:
++    case 0x64:  /* %fs: */
++    case 0x65:  /* %gs: */
++    case 0x66:  /* opcode size */
++    case 0x67:  /* addr size */
++    case 0xf0:  /* lock */
++    case 0xf2:  /* repne */
++    case 0xf3:  /* repe */
++        if (++prefix_count >= 15) return FALSE;
++        continue;
++
++    case 0xdb:
++        if (i == len - 1) return 0;
++        switch (instr[i + 1])
++        {
++        case 0xe1:
++            RIP_sig(sigcontext) += prefix_count + 2;
++            TRACE_(seh)( "skipped FNDISI instruction\n" );
++            return TRUE;
++        }
++        break;
++    default:
++        return FALSE;
++    }
++    return FALSE;
++}
++#endif
+ 
+ /***********************************************************************
+  *           is_privileged_instr
+@@ -2264,7 +2420,7 @@ static inline BOOL check_invalid_gsbase( struct thread_data *data, ucontext_t *u
+ #elif defined(__NetBSD__)
+     sysarch( X86_64_SET_GSBASE, &data->teb );
+ #elif defined(__APPLE__)
+-    /* leave_handler() will set GSBASE to the TEB */
++    /* CX Apple GS overlay: leave_handler keeps GSBASE as pthread */
+ #endif
+     return TRUE;
+ }
+@@ -2293,6 +2449,14 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+         rec.ExceptionCode = EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
+         break;
+     case TRAP_x86_PRIVINFLT:   /* Invalid opcode exception */
++#ifdef __APPLE__
++        /* CW HACK 20186 */
++        if (handle_cet_nop( sigcontext, &context.c )) return;
++        /* CW HACK 23427 */
++        if (emulate_xgetbv( sigcontext, &context.c )) return;
++        /* Winehq Bug 56441 */
++        if (handle_fndisi( sigcontext, &context.c )) return;
++#endif
+         rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+         break;
+     case TRAP_x86_STKFLT:  /* Stack fault */
+@@ -2611,6 +2775,18 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ 
+ 
+ #if defined(__APPLE__) || defined(__linux__)
++
++#ifdef __APPLE__
++/* CW Hack 24265 */
++extern void __restore_mxcsr_thunk(void);
++__ASM_GLOBAL_FUNC( __restore_mxcsr_thunk,
++                   "pushq %rcx\n\t"
++                   "movq %gs:0x30,%rcx\n\t"
++                   "ldmxcsr 0x33c(%rcx)\n\t"  /* amd64_thread_data()->mxcsr */
++                   "popq %rcx\n\t"
++                   "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_prolog_end") );
++#endif
++
+ /**********************************************************************
+  *		sigsys_handler
+  *
+@@ -2648,6 +2824,30 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+         frame->restore_flags |= CONTEXT_CONTROL;
+     }
+     RIP_sig(sigcontext) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
++
++#ifdef __APPLE__
++    /* CW Hack 24265 */
++    if (is_rosetta2 && FPU_sig(sigcontext))
++    {
++        XMM_SAVE_AREA32 fpu;
++        unsigned int direct_mxcsr;
++        __asm__ volatile( "stmxcsr %0" : "=m" (direct_mxcsr) );
++        memcpy( &fpu, FPU_sig(sigcontext), sizeof(fpu) );
++
++        if (direct_mxcsr != fpu.MxCsr)
++        {
++            fpu.MxCsr = direct_mxcsr;
++            memcpy( FPU_sig(sigcontext), &fpu, sizeof(fpu) );
++
++            /* On the M3, Rosetta will restore mxcsr to the initial, incorrect
++               value from the sigcontext, even if we change it. So we jump to a
++               thunk that restores the value from amd64_thread_data. */
++            amd64_thread_data(data)->mxcsr = direct_mxcsr;
++            RIP_sig(sigcontext) = (ULONG64)__restore_mxcsr_thunk;
++        }
++    }
++#endif
++
+ }
+ #endif
+ 
+@@ -2832,6 +3032,23 @@ void signal_init_process( TEB *teb )
+     alloc_syscall_frame( (frame_size + 63) & ~63 );
+     signal_alloc_thread( teb );
+ 
++#ifdef __APPLE__
++    /* CW Hack 24256: We need the value of sysctl.proc_translated in signal
++       handlers but sysctl[byname] is not signal-safe. */
++    {
++        int ret = 0;
++        size_t size = sizeof(ret);
++        if (sysctlbyname( "sysctl.proc_translated", &ret, &size, NULL, 0 ) == -1)
++            is_rosetta2 = 0;
++        else
++            is_rosetta2 = ret;
++    }
++
++    /* CW Hack 23427: __builtin_available presumably isn't signal-safe. */
++    if (__builtin_available( macOS 15.0, * ))
++        sequoia_or_later = TRUE;
++#endif
++
+     sig_act.sa_mask = server_block_set;
+     sig_act.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+ 
+@@ -2913,7 +3130,17 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
+ #elif defined(__NetBSD__)
+     sysarch( X86_64_SET_GSBASE, &teb );
+ #elif defined (__APPLE__)
+-    thread_data->pthread_teb = mac_thread_gsbase();
++    /* CX Apple GS overlay: keep GSBASE as pthread; mirror TEB fields into it.
++     * Skip when teb is unset (main system thread from apple_spawn_main_thread). */
++    if (teb && thread_data)
++    {
++        __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Tib.Self), "n" (FIELD_OFFSET(TEB, Tib.Self)));
++        __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->ThreadLocalStoragePointer), "n" (FIELD_OFFSET(TEB, ThreadLocalStoragePointer)));
++        __asm__ volatile ("movq %0,%%gs:%c1" :: "r" (teb->Peb), "n" (FIELD_OFFSET(TEB, Peb)));
++        thread_data->pthread_teb = mac_thread_gsbase();
++        /* alloc_tls_slot() needs to poke a value relative to each thread's gsbase. */
++        teb->Instrumentation[0] = thread_data->pthread_teb;
++    }
+ #else
+ # error Please define setting %gs for your architecture
+ #endif
+@@ -3022,7 +3249,12 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
+  */
+ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_gs_load") ":\n\t"
++#ifdef __APPLE__
++                   "movq %gs:0x30,%rcx\n\t"         /* Tib.Self (overlay) */
++                   "movq 0x378(%rcx),%rcx\n\t"      /* thread_data->syscall_frame */
++#else
+                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
++#endif
+                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+@@ -3146,12 +3378,6 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "popq %r8\n\t"
+                    "leaq -0x98(%rbp),%rcx\n"
+                    "2:\n\t"
+-#elif defined __APPLE__
+-                   "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+-                   "xorl %esi,%esi\n\t"
+-                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+-                   "syscall\n\t"
+-                   "leaq -0x98(%rbp),%rcx\n"
+ #endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                    "movl 0xb0(%rcx),%eax\n\t"      /* frame->syscall_id */
+@@ -3204,15 +3430,6 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "movw %dx,%ss\n\t"
+ # endif
+                    "1:\n\t"
+-#elif defined __APPLE__
+-                   "movq %rax,%r8\n\t"
+-                   "movq %rcx,%rdx\n\t"
+-                   "movq %r13,%rdi\n\t"            /* teb */
+-                   "xorl %esi,%esi\n\t"
+-                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+-                   "syscall\n\t"
+-                   "movq %rdx,%rcx\n\t"
+-                   "movq %r8,%rax\n\t"
+ #endif
+                    "movl 0xb4(%rcx),%edx\n\t"      /* frame->restore_flags */
+                    "testl $0x48,%edx\n\t"          /* CONTEXT_FLOATING_POINT | CONTEXT_XSTATE */
+@@ -3301,7 +3518,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "popfq\n\t"
+                    "iretq\n"
+                    /* RESTORE_FLAGS_INSTRUMENTATION */
++#ifdef __APPLE__
++                   "2:\tmovq %gs:0x30,%r10\n\t"
++                   "movq 0x330(%r10),%r10\n\t"
++#else
+                    "2:\tmovq %gs:0x330,%r10\n\t"  /* amd64_thread_data()->instrumentation_callback */
++#endif
+                    "movq (%r10),%r10\n\t"
+                    "test %r10,%r10\n\t"
+                    "jz 3b\n\t"
+@@ -3360,7 +3582,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
+                    "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
+ 
+ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
++#ifdef __APPLE__
++                   "movq %gs:0x30,%rcx\n\t"
++                   "movq 0x378(%rcx),%rcx\n\t"
++#else
+                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
++#endif
+                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+@@ -3378,7 +3605,12 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_instrumentation,
+ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "movq %rcx,%r10\n\t"
+                    __ASM_LOCAL_LABEL("__wine_unix_call_dispatcher_gs_load") ":\n\t"
++#ifdef __APPLE__
++                   "movq %gs:0x30,%rcx\n\t"
++                   "movq 0x378(%rcx),%rcx\n\t"
++#else
+                    "movq %gs:0x378,%rcx\n\t"       /* thread_data->syscall_frame */
++#endif
+                    "popq 0x70(%rcx)\n\t"           /* frame->rip */
+                    __ASM_CFI(".cfi_adjust_cfa_offset -8\n\t")
+                    __ASM_CFI_REG_IS_AT2(rip, rcx, 0xf0,0x00)
+@@ -3462,11 +3694,6 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "popq %r9\n\t"
+                    "popq %r8\n\t"
+                    "2:\n\t"
+-#elif defined __APPLE__
+-                   "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+-                   "xorl %esi,%esi\n\t"
+-                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+-                   "syscall\n\t"
+ #endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                    "movq %r8,%rdi\n\t"             /* args */
+@@ -3500,16 +3727,6 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+                    "movw %dx,%ss\n\t"
+ # endif
+                    "1:\n\t"
+-#elif defined __APPLE__
+-                   "movq %rax,%rdx\n\t"
+-                   "movq %rcx,%r14\n\t"
+-                   "movq %r13,%rdi\n\t"            /* teb */
+-                   "xorl %esi,%esi\n\t"
+-                   "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+-                   "syscall\n\t"
+-                   "movq %r14,%rcx\n\t"
+-                   "movq %rdx,%rax\n\t"
+-                   "movq 0x60(%rcx),%r14\n\t"
+ #endif
+                    "movq 0x58(%rcx),%r13\n\t"
+                    "movq 0x28(%rcx),%rdi\n\t"
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 0127a0530132ed281bf0e1578b5dd1103f470637..0bf13322739fd2921a60b669af6ca83a1a7f68a0 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -71,6 +71,7 @@
+ #include "wine/server.h"
+ #include "wine/debug.h"
+ #include "unix_private.h"
++#include "msync.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(sync);
+ 
+@@ -449,6 +450,55 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
+     return errno_to_status( errno );
+ }
+ 
++
++#elif defined(__APPLE__)
++
++static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
++{
++    return msync_release_semaphore_obj( obj, count, prev_count );
++}
++
++static NTSTATUS linux_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info )
++{
++    return msync_query_semaphore_obj( obj, info );
++}
++
++static NTSTATUS linux_set_event_obj( int obj, LONG *prev_state )
++{
++    return msync_set_event_obj( obj, prev_state );
++}
++
++static NTSTATUS linux_reset_event_obj( int obj, LONG *prev_state )
++{
++    return msync_reset_event_obj( obj, prev_state );
++}
++
++static NTSTATUS linux_pulse_event_obj( int obj, LONG *prev_state )
++{
++    return msync_pulse_event_obj( obj, prev_state );
++}
++
++static NTSTATUS linux_query_event_obj( int obj, EVENT_BASIC_INFORMATION *info )
++{
++    return msync_query_event_obj( obj, info );
++}
++
++static NTSTATUS linux_release_mutex_obj( int obj, LONG *prev_count )
++{
++    return msync_release_mutex_obj( obj, prev_count );
++}
++
++static NTSTATUS linux_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
++{
++    return msync_query_mutex_obj( obj, info );
++}
++
++static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_TYPE type,
++                                 int alert_fd, const LARGE_INTEGER *timeout )
++{
++    return msync_wait_objs( count, objs, type != WaitAll, alert_fd, timeout );
++}
++
+ #else /* NTSYNC_IOC_EVENT_READ */
+ 
+ static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
+@@ -634,7 +684,13 @@ static void release_inproc_sync( struct inproc_sync *sync )
+     LONG ref = InterlockedDecrement( &sync->refcount );
+ 
+     assert( ref >= 0 );
+-    if (!ref) close( fd );
++    if (!ref)
++    {
++        if (do_msync())
++            msync_close( fd );
++        else
++            close( fd );
++    }
+ }
+ 
+ static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
+@@ -675,8 +731,15 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync
+         {
+             obj_handle_t fd_handle;
+             sync->refcount = 1;
+-            sync->fd = wine_server_receive_fd( &fd_handle );
+-            assert( wine_server_ptr_handle(fd_handle) == handle );
++            if (do_msync())
++            {
++                sync->fd = reply->shm_idx;
++            }
++            else
++            {
++                sync->fd = wine_server_receive_fd( &fd_handle );
++                assert( wine_server_ptr_handle(fd_handle) == handle );
++            }
+             sync->access = reply->access;
+             sync->type = reply->type;
+             sync->closed = 0;
+@@ -884,8 +947,15 @@ static int get_inproc_alert_fd(void)
+         {
+             if (!server_call_unlocked( req ))
+             {
+-                data->alert_fd = fd = wine_server_receive_fd( &token );
+-                assert( token == reply->handle );
++                if (do_msync())
++                {
++                    data->alert_fd = fd = reply->handle;
++                }
++                else
++                {
++                    data->alert_fd = fd = wine_server_receive_fd( &token );
++                    assert( token == reply->handle );
++                }
+             }
+         }
+         SERVER_END_REQ;
+@@ -992,6 +1062,8 @@ NTSTATUS WINAPI NtCreateSemaphore( HANDLE *handle, ACCESS_MASK access, const OBJ
+ }
+ 
+ 
++
++
+ /******************************************************************************
+  *              NtOpenSemaphore (NTDLL.@)
+  */
+@@ -1085,6 +1157,8 @@ NTSTATUS WINAPI NtReleaseSemaphore( HANDLE handle, ULONG count, ULONG *previous
+ }
+ 
+ 
++
++
+ /**************************************************************************
+  *              NtCreateEvent (NTDLL.@)
+  */
+@@ -1118,6 +1192,8 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
+ }
+ 
+ 
++
++
+ /******************************************************************************
+  *              NtOpenEvent (NTDLL.@)
+  */
+@@ -1169,6 +1245,8 @@ NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
+ }
+ 
+ 
++
++
+ /******************************************************************************
+  *              NtSetEventBoostPriority (NTDLL.@)
+  */
+@@ -1202,6 +1280,8 @@ NTSTATUS WINAPI NtResetEvent( HANDLE handle, LONG *prev_state )
+ }
+ 
+ 
++
++
+ /******************************************************************************
+  *              NtClearEvent (NTDLL.@)
+  */
+@@ -1212,6 +1292,8 @@ NTSTATUS WINAPI NtClearEvent( HANDLE handle )
+ }
+ 
+ 
++
++
+ /******************************************************************************
+  *              NtPulseEvent (NTDLL.@)
+  */
+@@ -1236,6 +1318,8 @@ NTSTATUS WINAPI NtPulseEvent( HANDLE handle, LONG *prev_state )
+ }
+ 
+ 
++
++
+ /******************************************************************************
+  *              NtQueryEvent (NTDLL.@)
+  */
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index 5e30f0e18680ae70ac73bcc94857338f281a79cf..93ddbb8ab4e9f2765a77e5d03999fe39d8e917ad 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -1367,6 +1367,12 @@ static NTSTATUS create_logical_proc_info(void)
+     if (sysctlbyname("hw.physicalcpu", &cores_no, &size, NULL, 0))
+         cores_no = lcpu_no;
+ 
++    /* CW HACK 24711: allow restricting the number of processors through an environment variable.
++     * Don't report more packages or physical cores than logical cores.
++     */
++    pkgs_no = MIN(pkgs_no, lcpu_no);
++    cores_no = MIN(cores_no, lcpu_no);
++
+     TRACE("%u logical CPUs from %u physical cores across %u packages\n",
+             lcpu_no, cores_no, pkgs_no);
+ 
+@@ -1429,6 +1435,14 @@ static NTSTATUS create_logical_proc_info(void)
+         cache_sharing[4] = cache_sharing[3];
+         cache_sharing[3] = cache_sharing[2];
+         cache_sharing[2] = cache_sharing[1];
++
++        /* CW HACK 24711: allow restricting the number of processors through an environment variable
++         * The number of processors (logical cores) needs to be divisible by the number of logical
++         * cores sharing a cache.
++         */
++        if (cache_sharing[4] && (lcpu_no % cache_sharing[4])) cache_sharing[4] = 1;
++        if (cache_sharing[3] && (lcpu_no % cache_sharing[3])) cache_sharing[3] = 1;
++        if (cache_sharing[2] && (lcpu_no % cache_sharing[2])) cache_sharing[2] = 1;
+     }
+ 
+     for(p = 0; p < pkgs_no; ++p)
+@@ -1760,6 +1774,23 @@ void init_cpu_info(void)
+     num = 1;
+     FIXME("Detecting the number of processors is not supported.\n");
+ #endif
++
++#if defined(__APPLE__)
++    /* CW HACK 24711: allow restricting the number of processors through an environment variable */
++    {
++        const char *ncpu = getenv("WINENCPU");
++        if (ncpu)
++        {
++            long num_override = atoi(ncpu);
++            if (num_override > 0 && num_override < num)
++            {
++                num = num_override;
++                WARN("Restricting number of processors to %ld.\n", num);
++            }
++        }
++    }
++#endif
++
+     peb->NumberOfProcessors = num;
+     init_cpu_model();
+     get_random( &process_cookie, sizeof(process_cookie) );
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index c6b99b747f8b8292333d4a9fe1b4bebd568d9261..6b71c2626d0c432326aecb7f65e6707e0e36e5d1 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1121,6 +1121,16 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
+     close( data->wait_fd[1] );
+     close( data->reply_fd );
+     close( data->request_fd );
++
++#if defined(__APPLE__) && defined(__x86_64__)
++    /* Remove the PEB from the localtime field in %gs, or MacOS might try
++     * to free() the pointer and crash. That happens for processes that are
++     * using the alt loader for dock integration. */
++    __asm__ volatile (".byte 0x65\n\tmovq %q0,%c1"
++                      :
++                      : "r" ((void *)0), "n" (FIELD_OFFSET(TEB, Peb)));
++#endif
++
+     pthread_exit( UIntToPtr(status) );
+ }
+ 
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 1a63f7d97ea325fd0871f8a958148d7d36bcb35e..c92a8a72d3dba4ad34ca29fcac2d9d9d8cdd144f 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4635,6 +4635,27 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+         WARN( "treating read fault in a readable page as a write fault, addr %p\n", addr );
+         err = EXCEPTION_WRITE_FAULT;
+     }
++
++    /* CW Hack 24945 */
++    if (err == EXCEPTION_WRITE_FAULT &&
++        ((get_unix_prot( vprot ) & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)))
++    {
++        FIXME( "HACK: write fault on a w|x page, addr %p\n", addr );
++        mprotect_range( page, page_size, 0, VPROT_EXEC );
++        mprotect_range( page, page_size, VPROT_EXEC, 0 );
++        ret = STATUS_SUCCESS;
++        goto done;
++    }
++
++    /* CW Hack 25719 */
++    if (err == EXCEPTION_EXECUTE_FAULT && (get_unix_prot( vprot ) & PROT_EXEC))
++    {
++        FIXME( "HACK: exec fault on executable page, addr %p\n", addr );
++        mprotect_range( page, page_size, 0, VPROT_EXEC );
++        mprotect_range( page, page_size, VPROT_EXEC, 0 );
++        ret = STATUS_SUCCESS;
++        goto done;
++    }
+ #endif
+ 
+     if (!is_inside_signal_stack( data, stack ) && (vprot & VPROT_GUARD))
+@@ -4671,6 +4692,10 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+                 ret = STATUS_SUCCESS;
+         }
+     }
++
++#ifdef __APPLE__
++done:
++#endif
+     mutex_unlock( &virtual_mutex );
+     rec->ExceptionCode = ret;
+     return ret;
+@@ -6858,6 +6883,56 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
+     return status;
+ }
+ 
++#ifdef __APPLE__
++static int is_apple_silicon(void)
++{
++    static int apple_silicon_status, did_check = 0;
++    if (!did_check)
++    {
++        /* returns 0 for native process or on error, 1 for translated */
++        int ret = 0;
++        size_t size = sizeof(ret);
++        if (sysctlbyname( "sysctl.proc_translated", &ret, &size, NULL, 0 ) == -1)
++            apple_silicon_status = 0;
++        else
++            apple_silicon_status = ret;
++
++        did_check = 1;
++    }
++
++    return apple_silicon_status;
++}
++
++/* CW HACK 18947
++ * If mach_vm_write() is used to modify code cross-process (which is how we implement
++ * NtWriteVirtualMemory), Rosetta won't notice the change and will execute the "old" code.
++ *
++ * To work around this, after the write completes,
++ * toggle the executable bit (from inside the target process) on/off for any executable
++ * pages that were modified, to force Rosetta to re-translate it.
++ */
++static void toggle_executable_pages_for_rosetta( HANDLE process, void *addr, SIZE_T size )
++{
++    MEMORY_BASIC_INFORMATION info;
++    NTSTATUS status;
++    SIZE_T ret;
++
++    if (!is_apple_silicon())
++        return;
++
++    status = NtQueryVirtualMemory( process, addr, MemoryBasicInformation, &info, sizeof(info), &ret );
++
++    if (!status && (info.AllocationProtect & 0xf0))
++    {
++        DWORD origprot, noexec;
++        noexec = info.AllocationProtect & ~0xf0;
++        if (!noexec) noexec = PAGE_NOACCESS;
++
++        NtProtectVirtualMemory( process, &addr, &size, noexec, &origprot );
++        NtProtectVirtualMemory( process, &addr, &size, origprot, &noexec );
++    }
++}
++#endif
+ 
+ /***********************************************************************
+  *             NtWriteVirtualMemory   (NTDLL.@)
+@@ -6879,6 +6954,10 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
+             size = reply->written;
+         }
+         SERVER_END_REQ;
++
++#ifdef __APPLE__
++        toggle_executable_pages_for_rosetta( process, addr, size );
++#endif
+     }
+     else
+     {
+diff --git a/dlls/ntdll/unixlib.h b/dlls/ntdll/unixlib.h
+index 9cb444342fe2b9756a28d64778076cb489c46340..3a4a3700e0301e352674ba5590d852e859c6bf3d 100644
+--- a/dlls/ntdll/unixlib.h
++++ b/dlls/ntdll/unixlib.h
+@@ -66,6 +66,12 @@ struct unwind_builtin_dll_params
+     CONTEXT                    *context;
+ };
+ 
++struct pe_module_loaded_params
++{
++    void *start;
++    void *end;
++};
++
+ enum ntdll_unix_funcs
+ {
+     unix_load_so_dll,
+@@ -76,6 +82,9 @@ enum ntdll_unix_funcs
+     unix_wine_server_handle_to_fd,
+     unix_wine_spawnvp,
+     unix_system_time_precise,
++#if defined(__x86_64__)
++    unix_pe_module_loaded,
++#endif
+ };
+ 
+ extern unixlib_handle_t __wine_unixlib_handle;
+diff --git a/dlls/wow64cpu/cpu.c b/dlls/wow64cpu/cpu.c
+index 3d73ff3b3c2c394b91c74bc5b34d66725d34a2a8..02ef80b3fc53a0cad92690f96bcc69ca93d270fd 100644
+--- a/dlls/wow64cpu/cpu.c
++++ b/dlls/wow64cpu/cpu.c
+@@ -39,10 +39,35 @@ struct thunk_32to64
+     DWORD addr;
+     WORD  cs;
+ };
++struct thunk_32to64_rosetta2_workaround
++{
++    BYTE  lcall;  /* call far, absolute indirect */
++    BYTE  modrm;  /* address=disp32, opcode=3 */
++    DWORD op;
++    DWORD addr;
++    WORD  cs;
++
++    BYTE add;
++    BYTE add_modrm;
++    BYTE add_op;
++
++    BYTE jmp;
++    BYTE jmp_modrm;
++    DWORD jmp_op;
++    ULONG64 jmp_addr;
++};
+ struct thunk_opcodes
+ {
+-    struct thunk_32to64 syscall_thunk;
+-    struct thunk_32to64 unix_thunk;
++    union
++    {
++        struct thunk_32to64 syscall_thunk;
++        struct thunk_32to64_rosetta2_workaround syscall_thunk_rosetta;
++    };
++    union
++    {
++        struct thunk_32to64 unix_thunk;
++        struct thunk_32to64_rosetta2_workaround unix_thunk_rosetta;
++    };
+ };
+ #pragma pack(pop)
+ 
+@@ -57,6 +82,19 @@ static USHORT fs32_sel;
+ 
+ void **__wine_unix_call_dispatcher = NULL;
+ 
++BOOL use_rosetta2_workaround;
++
++static BOOL is_rosetta2(void)
++{
++    char buffer[64];
++    NTSTATUS status = NtQuerySystemInformation( SystemProcessorBrandString, buffer, sizeof(buffer), NULL );
++
++    if (status || !strstr( buffer, "VirtualApple" ))
++        return FALSE;
++
++    return TRUE;
++}
++
+ BOOL WINAPI DllMain( HINSTANCE inst, DWORD reason, void *reserved )
+ {
+     if (reason == DLL_PROCESS_ATTACH) LdrDisableThreadCalloutsForDll( inst );
+@@ -210,7 +248,21 @@ __ASM_GLOBAL_FUNC( syscall_32to64,
+                    "movl %edx,4(%rsp)\n\t"
+                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
+                    "xchgq %r14,%rsp\n\t"
+-                   "ljmp *(%r14)\n"
++
++                   /* CW HACK 20760:
++                    * When running under Rosetta 2, use lretq instead of ljmp to work around a SIGUSR1 race condition.
++                    */
++                   "cmpl $0, " __ASM_NAME("use_rosetta2_workaround") "\n\t"
++                   "jne syscall_32to64_rosetta2_workaround\n\t"
++                   "ljmp *(%r14)\n\t"
++                   "syscall_32to64_rosetta2_workaround:\n\t"
++                   "subq $0x10,%rsp\n\t"
++                   "movl 4(%r14),%edx\n\t"
++                   "movq %rdx,0x8(%rsp)\n\t"
++                   "movl 0(%r14),%edx\n\t"
++                   "movq %rdx,(%rsp)\n\t"
++                   "lretq\n"
++
+                    ".Lsyscall_32to64_return:\n\t"
+                    "movq %rsp,%r14\n\t"
+                    "movl 0xa8(%r13),%edx\n\t"   /* context->Edx */
+@@ -270,7 +322,20 @@ __ASM_GLOBAL_FUNC( unix_call_32to64,
+                    "movl %edx,4(%rsp)\n\t"
+                    "movl 0xc4(%r13),%r14d\n\t"  /* context->Esp */
+                    "xchgq %r14,%rsp\n\t"
+-                   "ljmp *(%r14)" )
++
++                   /* CW HACK 20760:
++                    * When running under Rosetta 2, use lretq instead of ljmp to work around a SIGUSR1 race condition.
++                    */
++                   "cmpl $0, " __ASM_NAME("use_rosetta2_workaround") "\n\t"
++                   "jne unix_call_32to64_rosetta2_workaround\n\t"
++                   "ljmp *(%r14)\n\t"
++                   "unix_call_32to64_rosetta2_workaround:\n\t"
++                   "subq $0x10,%rsp\n\t"
++                   "movl 4(%r14),%edx\n\t"
++                   "movq %rdx,0x8(%rsp)\n\t"
++                   "movl 0(%r14),%edx\n\t"
++                   "movq %rdx,(%rsp)\n\t"
++                   "lretq" )
+ 
+ 
+ /**********************************************************************
+@@ -321,6 +386,8 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
+ 
+     wow64info->CpuFlags |= WOW64_CPUFLAGS_MSFT64;
+ 
++    use_rosetta2_workaround = is_rosetta2();
++
+     LdrGetDllHandle( NULL, 0, &str, &module );
+     p__wine_unix_call_dispatcher = RtlFindExportedRoutineByName( module, "__wine_unix_call_dispatcher" );
+     __wine_unix_call_dispatcher = *p__wine_unix_call_dispatcher;
+@@ -335,17 +402,65 @@ NTSTATUS WINAPI BTCpuProcessInit(void)
+     cs32_sel = context_i386.SegCs;
+     ss32_sel = context_i386.SegSs;
+ 
+-    thunk->syscall_thunk.ljmp  = 0xff;
+-    thunk->syscall_thunk.modrm = 0x2d;
+-    thunk->syscall_thunk.op    = PtrToUlong( &thunk->syscall_thunk.addr );
+-    thunk->syscall_thunk.addr  = PtrToUlong( syscall_32to64 );
+-    thunk->syscall_thunk.cs    = cs64_sel;
+-
+-    thunk->unix_thunk.ljmp  = 0xff;
+-    thunk->unix_thunk.modrm = 0x2d;
+-    thunk->unix_thunk.op    = PtrToUlong( &thunk->unix_thunk.addr );
+-    thunk->unix_thunk.addr  = PtrToUlong( unix_call_32to64 );
+-    thunk->unix_thunk.cs    = cs64_sel;
++    /* CW HACK 20760 */
++    if (use_rosetta2_workaround)
++    {
++        thunk->syscall_thunk_rosetta.lcall     = 0xff;
++        thunk->syscall_thunk_rosetta.modrm     = 0x1d;
++        thunk->syscall_thunk_rosetta.op        = PtrToUlong( &thunk->syscall_thunk_rosetta.addr );
++        thunk->syscall_thunk_rosetta.addr      = PtrToUlong( &thunk->syscall_thunk_rosetta.add );
++        thunk->syscall_thunk_rosetta.cs        = cs64_sel;
++
++        /* We are now in 64-bit. */
++        /* add $0x08,%esp to remove the addr/segment pushed on the stack by the lcall */
++        thunk->syscall_thunk_rosetta.add       = 0x83;
++        thunk->syscall_thunk_rosetta.add_modrm = 0xc4;
++        thunk->syscall_thunk_rosetta.add_op    = 0x08;
++
++        /* jmp to syscall_32to64 */
++        thunk->syscall_thunk_rosetta.jmp       = 0xff;
++        thunk->syscall_thunk_rosetta.jmp_modrm = 0x25;
++        thunk->syscall_thunk_rosetta.jmp_op    = 0x00;
++        thunk->syscall_thunk_rosetta.jmp_addr  = PtrToUlong( syscall_32to64 );
++    }
++    else
++    {
++        thunk->syscall_thunk.ljmp  = 0xff;
++        thunk->syscall_thunk.modrm = 0x2d;
++        thunk->syscall_thunk.op    = PtrToUlong( &thunk->syscall_thunk.addr );
++        thunk->syscall_thunk.addr  = PtrToUlong( syscall_32to64 );
++        thunk->syscall_thunk.cs    = cs64_sel;
++    }
++
++    /* CW HACK 20760 */
++    if (use_rosetta2_workaround)
++    {
++        thunk->unix_thunk_rosetta.lcall     = 0xff;
++        thunk->unix_thunk_rosetta.modrm     = 0x1d;
++        thunk->unix_thunk_rosetta.op        = PtrToUlong( &thunk->unix_thunk_rosetta.addr );
++        thunk->unix_thunk_rosetta.addr      = PtrToUlong( &thunk->unix_thunk_rosetta.add );
++        thunk->unix_thunk_rosetta.cs        = cs64_sel;
++
++        /* We are now in 64-bit. */
++        /* add $0x08,%esp to remove the addr/segment pushed on the stack by the lcall */
++        thunk->unix_thunk_rosetta.add       = 0x83;
++        thunk->unix_thunk_rosetta.add_modrm = 0xc4;
++        thunk->unix_thunk_rosetta.add_op    = 0x08;
++
++        /* jmp to unix_call_32to64 */
++        thunk->unix_thunk_rosetta.jmp       = 0xff;
++        thunk->unix_thunk_rosetta.jmp_modrm = 0x25;
++        thunk->unix_thunk_rosetta.jmp_op    = 0x00;
++        thunk->unix_thunk_rosetta.jmp_addr  = PtrToUlong( unix_call_32to64 );
++    }
++    else
++    {
++        thunk->unix_thunk.ljmp  = 0xff;
++        thunk->unix_thunk.modrm = 0x2d;
++        thunk->unix_thunk.op    = PtrToUlong( &thunk->unix_thunk.addr );
++        thunk->unix_thunk.addr  = PtrToUlong( unix_call_32to64 );
++        thunk->unix_thunk.cs    = cs64_sel;
++    }
+ 
+     NtProtectVirtualMemory( GetCurrentProcess(), (void **)&thunk, &size, PAGE_EXECUTE_READ, &old_prot );
+     return STATUS_SUCCESS;
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index 6f30cf06879386bdea85514ebd812f8e28484fe5..f08bd3b03993de2cdb3cdbcd30c0a7eb84a655c9 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6067,6 +6067,8 @@ struct get_inproc_sync_fd_reply
+     struct reply_header __header;
+     int           type;
+     unsigned int access;
++    unsigned int shm_idx;
++    char __pad_20[4];
+ };
+ 
+ 
+@@ -7183,6 +7185,6 @@ union generic_reply
+     struct alpc_create_port_reply alpc_create_port_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 961
++#define SERVER_PROTOCOL_VERSION 962
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+diff --git a/server/Makefile.in b/server/Makefile.in
+index 0dd53951c4f64fe790a553d3684d9e5cdbaf8f6c..ba05306db750255f7ca4b92be0023051a5159368 100644
+--- a/server/Makefile.in
++++ b/server/Makefile.in
+@@ -23,6 +23,7 @@ SOURCES = \
+ 	mailslot.c \
+ 	main.c \
+ 	mapping.c \
++	msync.c \
+ 	mutex.c \
+ 	named_pipe.c \
+ 	object.c \
+diff --git a/server/inproc_sync.c b/server/inproc_sync.c
+index 522d9a4e3201705db0842c0e0ec156d53536e236..254c7951c3e22bb671632579d4e9781451368144 100644
+--- a/server/inproc_sync.c
++++ b/server/inproc_sync.c
+@@ -32,6 +32,7 @@
+ #include "request.h"
+ #include "thread.h"
+ #include "user.h"
++#include "msync.h"
+ 
+ #ifdef HAVE_LINUX_NTSYNC_H
+ # include <linux/ntsync.h>
+@@ -223,6 +224,178 @@ static int get_obj_inproc_sync( struct object *obj, int *type )
+     return fd;
+ }
+ 
++
++#elif defined(__APPLE__)
++
++#include <fcntl.h>
++
++int get_inproc_device_fd(void)
++{
++    static int fd = -2;
++    if (!do_msync()) return -1;
++    if (fd == -2) fd = open( "/dev/null", O_CLOEXEC | O_RDONLY );
++    return fd;
++}
++
++struct inproc_sync
++{
++    struct object          obj;
++    enum inproc_sync_type  type;
++    struct msync          *msync;
++};
++
++static void inproc_sync_dump( struct object *obj, int verbose );
++static int inproc_sync_signal( struct object *obj, unsigned int access, int signal );
++static void inproc_sync_destroy( struct object *obj );
++
++static const struct object_ops inproc_sync_ops =
++{
++    .size    = sizeof(struct inproc_sync),
++    .type    = &no_type,
++    .dump    = inproc_sync_dump,
++    .signal  = inproc_sync_signal,
++    .destroy = inproc_sync_destroy,
++};
++
++int get_inproc_sync_fd( struct inproc_sync *sync )
++{
++    if (!sync) return -1;
++    if (do_msync()) return (int)sync->msync->shm_idx;
++    return -1;
++}
++
++struct inproc_sync *create_inproc_internal_sync( int manual, int signaled )
++{
++    struct inproc_sync *event;
++
++    if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
++    event->type = INPROC_SYNC_INTERNAL;
++    event->msync = create_msync( signaled, 0xdeadbeef, manual ? MSYNC_MANUAL_SERVER : MSYNC_AUTO_SERVER );
++
++    if (!event->msync)
++    {
++        set_error( STATUS_NO_MEMORY );
++        release_object( event );
++        return NULL;
++    }
++    return event;
++}
++
++struct inproc_sync *create_inproc_event_sync( int manual, int signaled )
++{
++    struct inproc_sync *event;
++
++    if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
++    event->type = INPROC_SYNC_EVENT;
++    event->msync = create_msync( signaled, 0xdeadbeef, manual ? MSYNC_MANUAL_EVENT : MSYNC_AUTO_EVENT );
++
++    if (!event->msync)
++    {
++        set_error( STATUS_NO_MEMORY );
++        release_object( event );
++        return NULL;
++    }
++    return event;
++}
++
++struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int count )
++{
++    struct inproc_sync *mutex;
++
++    if (!(mutex = alloc_object( &inproc_sync_ops ))) return NULL;
++    mutex->type = INPROC_SYNC_MUTEX;
++    mutex->msync = create_msync( owner, count, MSYNC_MUTEX);
++
++    if (!mutex->msync)
++    {
++        set_error( STATUS_NO_MEMORY );
++        release_object( mutex );
++        return NULL;
++    }
++    return mutex;
++}
++
++struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned int max )
++{
++    struct inproc_sync *sem;
++
++    if (!(sem = alloc_object( &inproc_sync_ops ))) return NULL;
++    sem->type = INPROC_SYNC_SEMAPHORE;
++    sem->msync = create_msync( initial, max, MSYNC_SEMAPHORE );
++
++    if (!sem->msync)
++    {
++        set_error( STATUS_NO_MEMORY );
++        release_object( sem );
++        return NULL;
++    }
++    return sem;
++}
++
++static void inproc_sync_dump( struct object *obj, int verbose )
++{
++    struct inproc_sync *sync = (struct inproc_sync *)obj;
++    assert( obj->ops == &inproc_sync_ops );
++
++    fprintf( stderr, "Inproc sync type=%d, msync idx=%d\n", sync->type, sync->msync->shm_idx );
++}
++
++void signal_inproc_sync( struct inproc_sync *sync )
++{
++    if (debug_level) fprintf( stderr, "set_inproc_event %d\n", sync->msync->shm_idx );
++    msync_set_event( sync->msync );
++}
++
++void reset_inproc_sync( struct inproc_sync *sync )
++{
++    if (debug_level) fprintf( stderr, "reset_inproc_event %d\n", sync->msync->shm_idx );
++    msync_reset_event( sync->msync );
++}
++
++static int inproc_sync_signal( struct object *obj, unsigned int access, int signal )
++{
++    struct inproc_sync *sync = (struct inproc_sync *)obj;
++    assert( obj->ops == &inproc_sync_ops );
++
++    assert( sync->type == INPROC_SYNC_INTERNAL || sync->type == INPROC_SYNC_EVENT );
++    assert( signal == 0 || signal == 1 );
++
++    if (signal) signal_inproc_sync( sync );
++    else reset_inproc_sync( sync );
++    return 1;
++}
++
++static void inproc_sync_destroy( struct object *obj )
++{
++    struct inproc_sync *sync = (struct inproc_sync *)obj;
++    assert( obj->ops == &inproc_sync_ops );
++    msync_destroy( sync->msync );
++}
++
++void abandon_inproc_mutexes( thread_id_t tid )
++{
++    if (do_msync()) msync_abandon_mutexes( tid );
++}
++
++static int get_obj_inproc_sync( struct object *obj, int *type )
++{
++    struct object *sync;
++    int shm_idx = -1;
++
++    if (!do_msync()) return -1;
++    if (!(sync = get_obj_sync( obj ))) return -1;
++    if (sync->ops == &inproc_sync_ops)
++    {
++        struct inproc_sync *inproc = (struct inproc_sync *)sync;
++        msync_grab_object( inproc->msync );
++        *type = inproc->type;
++        shm_idx = (int)inproc->msync->shm_idx;
++    }
++
++    release_object( sync );
++    return shm_idx;
++}
++
+ #else /* NTSYNC_IOC_EVENT_READ */
+ 
+ int get_inproc_device_fd(void)
+@@ -284,7 +457,11 @@ DECL_HANDLER(get_inproc_sync_fd)
+     reply->access = get_handle_access( current->process, req->handle );
+ 
+     if ((fd = get_obj_inproc_sync( obj, &reply->type )) < 0) set_error( STATUS_NOT_IMPLEMENTED );
+-    else send_client_fd( current->process, fd, req->handle );
++    else
++    {
++        if (do_msync()) reply->shm_idx = (unsigned int)fd;
++        else send_client_fd( current->process, fd, req->handle );
++    }
+ 
+     release_object( obj );
+ }
+diff --git a/server/main.c b/server/main.c
+index 46419a09cb44cc3dcd7fa620f1e99a8b9a853da4..19127cea43b0c42a6a16e46da07c0375e7be72dd 100644
+--- a/server/main.c
++++ b/server/main.c
+@@ -40,6 +40,7 @@
+ #include "thread.h"
+ #include "request.h"
+ #include "unicode.h"
++#include "msync.h"
+ 
+ /* command-line options */
+ int debug_level = 0;
+@@ -257,7 +258,9 @@ int main( int argc, char *argv[] )
+     init_limits();
+ 
+     sock_init();
++    msync_init_shm();
+     open_master_socket();
++    msync_init();
+ 
+     if (debug_level) fprintf( stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );
+     set_current_time();
+diff --git a/server/msync.c b/server/msync.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..eecf9b37acc07cd08acd5e7061dfa1abdc1a2e05
+--- /dev/null
++++ b/server/msync.c
+@@ -0,0 +1,821 @@
++/*
++ * mach semaphore-based synchronization objects
++ *
++ * Copyright (C) 2018 Zebediah Figura
++ * Copyright (C) 2023 Marc-Aurel Zent
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifdef __APPLE__
++
++#include "config.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdio.h>
++#include <stdarg.h>
++#include <sys/mman.h>
++#ifdef HAVE_SYS_STAT_H
++# include <sys/stat.h>
++#endif
++#include <mach/mach_init.h>
++#include <mach/mach_port.h>
++#include <mach/mach_vm.h>
++#include <mach/vm_page_size.h>
++#include <mach/vm_map.h>
++#include <mach/message.h>
++#include <mach/port.h>
++#include <mach/task.h>
++#include <mach/semaphore.h>
++#include <mach/mach_error.h>
++#include <mach/thread_act.h>
++#include <servers/bootstrap.h>
++#include <sched.h>
++#include <dlfcn.h>
++#include <signal.h>
++#include <pthread.h>
++#include <unistd.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++
++#include "handle.h"
++#include "request.h"
++#include "msync.h"
++
++#define UL_COMPARE_AND_WAIT_SHARED  0x3
++#define ULF_WAKE_ALL                0x00000100
++extern int __ulock_wake( uint32_t operation, void *addr, uint64_t wake_value );
++
++
++#define MACH_CHECK_ERROR(ret, operation) \
++    if (ret != KERN_SUCCESS) \
++        fprintf(stderr, "msync: error: %s failed with %d: %s\n", \
++            operation, ret, mach_error_string(ret));
++
++/* Private API to register a mach port with the bootstrap server */
++extern kern_return_t bootstrap_register2( mach_port_t bp, name_t service_name, mach_port_t sp, int flags );
++
++/*
++ * Faster to directly do the syscall and inline everything, taken and slightly adapted
++ * from xnu/libsyscall/mach/mach_msg.c
++ */
++
++#define LIBMACH_OPTIONS64 (MACH_SEND_INTERRUPT|MACH_RCV_INTERRUPT)
++#define MACH64_SEND_MQ_CALL 0x0000000400000000ull
++
++typedef mach_msg_return_t (*mach_msg2_trap_ptr_t)( void *data, uint64_t options,
++    uint64_t msgh_bits_and_send_size, uint64_t msgh_remote_and_local_port,
++    uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout );
++
++static mach_msg2_trap_ptr_t mach_msg2_trap;
++
++static inline mach_msg_return_t mach_msg2_internal( void *data, uint64_t option64, uint64_t msgh_bits_and_send_size,
++    uint64_t msgh_remote_and_local_port, uint64_t msgh_voucher_and_id, uint64_t desc_count_and_rcv_name,
++    uint64_t rcv_size_and_priority, uint64_t timeout)
++{
++    mach_msg_return_t mr;
++
++    mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++             msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++             rcv_size_and_priority, timeout );
++
++    if (mr == MACH_MSG_SUCCESS)
++        return MACH_MSG_SUCCESS;
++
++    while (mr == MACH_SEND_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout );
++
++    while (mr == MACH_RCV_INTERRUPTED)
++        mr = mach_msg2_trap( data, option64 & ~LIBMACH_OPTIONS64, msgh_bits_and_send_size & 0xffffffffull,
++                 msgh_remote_and_local_port, msgh_voucher_and_id, desc_count_and_rcv_name,
++                 rcv_size_and_priority, timeout);
++
++    return mr;
++}
++
++static inline mach_msg_return_t mach_msg2( mach_msg_header_t *data, uint64_t option64,
++    mach_msg_size_t send_size, mach_msg_size_t rcv_size, mach_port_t rcv_name, uint64_t timeout,
++    uint32_t priority)
++{
++    mach_msg_base_t *base;
++    mach_msg_size_t descriptors;
++
++    if (!mach_msg2_trap)
++        return mach_msg( data, (mach_msg_option_t)option64, send_size,
++                         rcv_size, rcv_name, timeout, priority );
++
++    base = (mach_msg_base_t *)data;
++
++    if ((option64 & MACH_SEND_MSG) &&
++        (base->header.msgh_bits & MACH_MSGH_BITS_COMPLEX))
++        descriptors = base->body.msgh_descriptor_count;
++    else
++        descriptors = 0;
++
++#define MACH_MSG2_SHIFT_ARGS(lo, hi) ((uint64_t)hi << 32 | (uint32_t)lo)
++    return mach_msg2_internal(data, option64 | MACH64_SEND_MQ_CALL,
++               MACH_MSG2_SHIFT_ARGS(data->msgh_bits, send_size),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_remote_port, data->msgh_local_port),
++               MACH_MSG2_SHIFT_ARGS(data->msgh_voucher_port, data->msgh_id),
++               MACH_MSG2_SHIFT_ARGS(descriptors, rcv_name),
++               MACH_MSG2_SHIFT_ARGS(rcv_size, priority), timeout);
++#undef MACH_MSG2_SHIFT_ARGS
++}
++
++static mach_port_name_t receive_port;
++
++struct tid_node
++{
++    struct tid_node *next;
++    int tid;
++};
++
++#define MAX_POOL_NODES 0x80000
++
++struct node_memory_pool
++{
++    struct tid_node *nodes;
++    struct tid_node **free_nodes;
++    unsigned int count;
++};
++
++static struct node_memory_pool *pool;
++
++static void pool_init(void)
++{
++    unsigned int i;
++    pool = malloc( sizeof(struct node_memory_pool) );
++    pool->nodes = malloc( MAX_POOL_NODES * sizeof(struct tid_node) );
++    pool->free_nodes = malloc( MAX_POOL_NODES * sizeof(struct tid_node *) );
++    pool->count = MAX_POOL_NODES;
++
++    for (i = 0; i < MAX_POOL_NODES; i++)
++        pool->free_nodes[i] = &pool->nodes[i];
++}
++
++static inline struct tid_node *pool_alloc(void)
++{
++    if (pool->count == 0)
++    {
++        fprintf( stderr, "msync: warn: node memory pool exhausted\n" );
++        return malloc( sizeof(struct tid_node) );
++    }
++    return pool->free_nodes[--pool->count];
++}
++
++static inline void pool_free( struct tid_node *node )
++{
++    if (node < pool->nodes || node >= pool->nodes + MAX_POOL_NODES)
++    {
++        free(node);
++        return;
++    }
++    pool->free_nodes[pool->count++] = node;
++}
++
++struct tid_list
++{
++    struct tid_node *head;
++};
++
++static struct tid_list *tid_map;
++static size_t tid_map_size;
++static int *shm_tid_map;
++static const mach_vm_size_t shm_tid_size = 64 * 1024 * 1024; /* 64 MB to index 24 bit tids */
++
++/* This function should only be called from get_tid_list() */
++static void grow_tid_map( unsigned int shm_idx )
++{
++    size_t new_size = max(tid_map_size ? tid_map_size * 2 : 256, shm_idx + 1);
++    struct tid_list *new_tid_map;
++
++    new_tid_map = realloc( tid_map, new_size * sizeof(struct tid_list) );
++    assert( new_tid_map );
++    memset( new_tid_map + tid_map_size, 0, (new_size - tid_map_size) * sizeof(struct tid_list) );
++    tid_map = new_tid_map;
++    tid_map_size = new_size;
++}
++
++/* This function is not thread-safe and should only be called from the message thread! */
++static inline struct tid_list *get_tid_list( unsigned int shm_idx )
++{
++    if( shm_idx >= tid_map_size ) grow_tid_map( shm_idx );
++    return tid_map + shm_idx;
++}
++
++static inline void add_tid( unsigned int shm_idx, int tid )
++{
++    struct tid_node *new_node;
++    struct tid_list *list = get_tid_list( shm_idx );
++
++    new_node = pool_alloc();
++    new_node->tid = tid;
++
++    new_node->next = list->head;
++    list->head = new_node;
++}
++
++static inline void remove_tid( unsigned int shm_idx, int tid )
++{
++    struct tid_node *current, *prev = NULL;
++    struct tid_list *list = get_tid_list( shm_idx );
++
++    current = list->head;
++    while (current != NULL)
++    {
++        if (current->tid == tid)
++        {
++            if (prev == NULL)
++                list->head = current->next;
++            else
++                prev->next = current->next;
++            pool_free(current);
++            break;
++        }
++        prev = current;
++        current = current->next;
++    }
++}
++
++static long pagesize;
++static void *get_shm( unsigned int idx );
++
++typedef struct
++{
++    mach_msg_header_t header;
++    unsigned int shm_idx[MAXIMUM_WAIT_OBJECTS + 1];
++    mach_msg_trailer_t trailer;
++} mach_register_message_t;
++
++typedef struct
++{
++    mach_msg_header_t header;
++    int entry;
++    mach_msg_trailer_t trailer;
++} mach_map_message_t;
++
++typedef struct
++{
++    mach_msg_header_t header;
++    mach_msg_body_t body;
++    mach_msg_port_descriptor_t descriptor;
++} mach_map_message_reply_t;
++
++static void **shm_addrs;
++static int shm_addrs_size;  /* length of the allocated shm_addrs array */
++
++static void send_shm_to_client( mach_map_message_t *message )
++{
++    static mach_map_message_reply_t reply;
++    mach_msg_return_t mr;
++    kern_return_t kr;
++    memory_object_offset_t offset = 0;
++    mach_vm_size_t entry_size = 0;
++    mach_port_t entry_port = MACH_PORT_NULL;
++
++    if (message->header.msgh_id)
++    {
++        offset = (memory_object_offset_t)shm_tid_map;
++        entry_size = shm_tid_size;
++    }
++    else if (message->entry < shm_addrs_size)
++    {
++        offset = (memory_object_offset_t)shm_addrs[message->entry];
++        entry_size = pagesize;
++    }
++    else
++        fprintf( stderr, "msync: error: client requested out-of-bounds shm entry %d\n", message->entry );
++
++    kr = mach_make_memory_entry_64( mach_task_self(), &entry_size, offset, VM_PROT_DEFAULT,
++                                    &entry_port, MACH_PORT_NULL );
++
++    if (kr != KERN_SUCCESS)
++        fprintf( stderr, "msync: error: mach_make_memory_entry_64 failed with %d: %s\n", kr, mach_error_string( kr ) );
++
++    reply.header.msgh_bits = MACH_MSGH_BITS_SET( MACH_MSG_TYPE_COPY_SEND, 0, 0, MACH_MSGH_BITS_COMPLEX );
++    reply.header.msgh_id = message->header.msgh_id;
++    reply.header.msgh_size = sizeof(reply);
++    reply.header.msgh_remote_port = message->header.msgh_remote_port;
++    reply.body.msgh_descriptor_count = 1;
++    reply.descriptor.name = entry_port;
++    reply.descriptor.disposition = MACH_MSG_TYPE_COPY_SEND;
++    reply.descriptor.type = MACH_MSG_PORT_DESCRIPTOR;
++
++    mr = mach_msg2( &reply.header, MACH_SEND_MSG, reply.header.msgh_size,
++                    0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
++
++    if (mr != MACH_MSG_SUCCESS)
++        fprintf( stderr, "msync: error: failed to send shm entry to client: %x\n", mr );
++
++    mach_port_deallocate( mach_task_self(), message->header.msgh_remote_port );
++    mach_port_deallocate( mach_task_self(), entry_port );
++}
++
++static inline void unregister_wait( mach_register_message_t *message, unsigned int tid, unsigned int count )
++{
++    int i;
++
++    for (i = 0; i < count; i++)
++        remove_tid( message->shm_idx[i], tid );
++}
++
++static inline void wake_tid( int tid )
++{
++    int *shm = shm_tid_map + tid;
++
++    __atomic_store_n( shm, 0, __ATOMIC_RELEASE );
++    __ulock_wake( UL_COMPARE_AND_WAIT_SHARED, (void *)shm, 0 );
++}
++
++static inline void signal_all_internal( unsigned int shm_idx )
++{
++    struct tid_node *current, *temp;
++    struct tid_list *list = get_tid_list( shm_idx );
++
++    current = list->head;
++    list->head = NULL;
++
++    while (current)
++    {
++        wake_tid( current->tid );
++        temp = current;
++        current = current->next;
++        pool_free(temp);
++    }
++}
++
++/* shm layout for msync objects. */
++struct msync_shm
++{
++    int low;
++    int high;
++    unsigned short msync_type;
++    unsigned short refcount;
++    int multiple_waiters;
++};
++
++static unsigned int last_allocated_idx = 1;
++static unsigned int last_destroyed_idx = UINT32_MAX;
++
++static inline void destroy_all_internal( unsigned int shm_idx )
++{
++    struct msync_shm *obj = get_shm( shm_idx );
++    unsigned short refcount = __atomic_load_n( &obj->refcount, __ATOMIC_SEQ_CST );
++
++    if (!refcount)
++    {
++        fprintf( stderr, "msync: error: destroy_all on already destroyed shm idx %u with refcount %d\n", shm_idx, refcount );
++        return;
++    }
++
++    refcount = __atomic_sub_fetch( &obj->refcount, 1, __ATOMIC_SEQ_CST );
++
++    if (!refcount) last_destroyed_idx = shm_idx;
++}
++
++/*
++ * thread-safe sequentially consistent guarantees relative to register/unregister
++ * client-side are made by the mach messaging queue
++ */
++static inline mach_msg_return_t destroy_all( unsigned int shm_idx )
++{
++    static mach_msg_header_t send_header;
++    send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
++    send_header.msgh_id = shm_idx | (1 << 28);
++    send_header.msgh_size = sizeof(send_header);
++    send_header.msgh_remote_port = receive_port;
++
++    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
++                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0);
++}
++
++static inline mach_msg_return_t signal_all( unsigned int shm_idx, int *shm )
++{
++    static mach_msg_header_t send_header;
++    struct msync_shm *obj = (struct msync_shm *)shm;
++
++    __ulock_wake( UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL, (void *)shm, 0 );
++    if (!__atomic_load_n( &obj->multiple_waiters, __ATOMIC_SEQ_CST ))
++        return MACH_MSG_SUCCESS;
++
++    send_header.msgh_bits = MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND);
++    send_header.msgh_id = shm_idx;
++    send_header.msgh_size = sizeof(send_header);
++    send_header.msgh_remote_port = receive_port;
++
++    return mach_msg2( &send_header, MACH_SEND_MSG, send_header.msgh_size,
++                0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
++}
++
++static inline mach_msg_return_t receive_mach_msg( mach_register_message_t *buffer )
++{
++    return mach_msg2( (mach_msg_header_t *)buffer, MACH_RCV_MSG, 0,
++            sizeof(*buffer), receive_port, MACH_MSG_TIMEOUT_NONE, 0 );
++}
++
++static inline void decode_msgh_id( unsigned int msgh_id, unsigned int *tid, unsigned int *count )
++{
++    *tid = msgh_id >> 8;
++    *count = msgh_id & 0xFF;
++}
++
++static inline unsigned int check_bit( const unsigned int bit, unsigned int *shm_idx )
++{
++    unsigned int bit_val = (*shm_idx >> bit) & 1;
++    *shm_idx &= ~(1u << bit);
++    return bit_val;
++}
++
++static void *mach_message_pump( void *args )
++{
++    int i, val;
++    unsigned int tid, count, is_mutex;
++    struct msync_shm *obj;
++    mach_msg_return_t mr;
++    mach_register_message_t receive_message = { 0 };
++    sigset_t set;
++
++    sigfillset( &set );
++    pthread_sigmask( SIG_BLOCK, &set, NULL );
++
++    for (;;)
++    {
++        mr = receive_mach_msg( &receive_message );
++        if (mr != MACH_MSG_SUCCESS)
++        {
++            fprintf( stderr, "msync: failed to receive message\n");
++            continue;
++        }
++
++        /*
++         * A complex mach message, where the client expects a reply,
++         * is a send back a mach memory entry request.
++         */
++        if (receive_message.header.msgh_remote_port != MACH_PORT_NULL)
++        {
++            send_shm_to_client( (mach_map_message_t *)&receive_message );
++            continue;
++        }
++
++        /*
++         * A message with no body is a signal_all or destroy_all operation where the shm_idx
++         * is the msgh_id and the type of operation is decided by the 29th bit.
++         * (The shared memory index is only a 28-bit integer at max)
++         * See signal_all( unsigned int shm_idx ) and destroy_all( unsigned int shm_idx )above.
++         */
++        if (receive_message.header.msgh_size == sizeof(mach_msg_header_t))
++        {
++            if (check_bit( 28, (unsigned int *)&receive_message.header.msgh_id ))
++                destroy_all_internal( receive_message.header.msgh_id );
++            else
++                signal_all_internal( receive_message.header.msgh_id );
++            continue;
++        }
++
++        /*
++         * Finally server_register_wait and server_unregister_wait
++         */
++        decode_msgh_id( receive_message.header.msgh_id, &tid, &count );
++        for (i = 0; i < count; i++)
++        {
++            if (i == 0 && check_bit( 29, receive_message.shm_idx + i ))
++            {
++                unregister_wait( &receive_message, tid, count );
++                break;
++            }
++            is_mutex = check_bit( 28, receive_message.shm_idx + i );
++            obj = get_shm( receive_message.shm_idx[i] );
++            val = __atomic_load_n( &obj->low, __ATOMIC_SEQ_CST );
++            if ((is_mutex && (val == 0 || val == ~0 || val == tid)) || (!is_mutex && val != 0))
++            {
++                if (i > 1) unregister_wait( &receive_message, tid, i );
++                wake_tid( tid );
++                break;
++            }
++            add_tid( receive_message.shm_idx[i], tid );
++            if (i == count - 1)
++            {
++                /* The client can stop spinning and safely start waiting now */
++                __atomic_store_n( shm_tid_map + tid, 1, __ATOMIC_RELEASE );
++            }
++        }
++    }
++
++    return NULL;
++}
++
++int do_msync(void)
++{
++    static int do_msync_cached = -1;
++
++    if (do_msync_cached == -1)
++    {
++        do_msync_cached = getenv("WINEMSYNC") && atoi(getenv("WINEMSYNC"));
++    }
++
++    return do_msync_cached;
++}
++
++static void set_thread_policy_qos( mach_port_t mach_thread_id )
++{
++    thread_extended_policy_data_t extended_policy;
++    thread_precedence_policy_data_t precedence_policy;
++    int throughput_qos, latency_qos;
++    kern_return_t kr;
++
++    latency_qos = LATENCY_QOS_TIER_0;
++    kr = thread_policy_set( mach_thread_id, THREAD_LATENCY_QOS_POLICY,
++                            (thread_policy_t)&latency_qos,
++                            THREAD_LATENCY_QOS_POLICY_COUNT);
++    if (kr != KERN_SUCCESS)
++        fprintf( stderr, "msync: error setting thread latency QoS.\n" );
++
++    throughput_qos = THROUGHPUT_QOS_TIER_0;
++    kr = thread_policy_set( mach_thread_id, THREAD_THROUGHPUT_QOS_POLICY,
++                            (thread_policy_t)&throughput_qos,
++                            THREAD_THROUGHPUT_QOS_POLICY_COUNT);
++    if (kr != KERN_SUCCESS)
++        fprintf( stderr, "msync: error setting thread throughput QoS.\n" );
++
++    extended_policy.timeshare = 0;
++    kr = thread_policy_set( mach_thread_id, THREAD_EXTENDED_POLICY,
++                            (thread_policy_t)&extended_policy,
++                            THREAD_EXTENDED_POLICY_COUNT );
++    if (kr != KERN_SUCCESS)
++        fprintf( stderr, "msync: error setting extended policy\n" );
++
++    precedence_policy.importance = 63;
++    kr = thread_policy_set( mach_thread_id, THREAD_PRECEDENCE_POLICY,
++                            (thread_policy_t)&precedence_policy,
++                            THREAD_PRECEDENCE_POLICY_COUNT );
++    if (kr != KERN_SUCCESS)
++        fprintf( stderr, "msync: error setting precedence policy\n" );
++}
++
++void msync_init_shm(void)
++{
++    kern_return_t kr;
++
++    if (!do_msync()) return;
++
++    pagesize = (long)vm_kernel_page_size;
++
++    shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
++    shm_addrs_size = 128;
++
++    kr = mach_vm_map( mach_task_self(), (mach_vm_address_t *)&shm_tid_map, shm_tid_size, 0, VM_FLAGS_ANYWHERE,
++                      MACH_PORT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_SHARE );
++
++    if (kr != KERN_SUCCESS)
++    {
++        fprintf( stderr, "msync: error: mach_vm_map failed with %d: %s\n", kr, mach_error_string( kr ) );
++        fatal_error( "could not map tid shared memory\n" );
++    }
++}
++
++void msync_init(void)
++{
++    struct stat st;
++    mach_port_t bootstrap_port;
++    mach_port_limits_t limits;
++    void *dlhandle = dlopen( NULL, RTLD_NOW );
++    pthread_t message_thread;
++    char message_port_name[28];
++
++    if (!do_msync()) return;
++
++    if (fstat( config_dir_fd, &st ) == -1)
++        fatal_error( "cannot stat config dir\n" );
++
++    if (st.st_ino != (unsigned long)st.st_ino)
++        snprintf( message_port_name, 28, "wine-%lx%08lx-msync", (unsigned long)((unsigned long long)st.st_ino >> 32), (unsigned long)st.st_ino );
++    else
++        snprintf( message_port_name, 28, "wine-%lx-msync", (unsigned long)st.st_ino );
++
++    /* Bootstrap mach server message pump */
++
++    mach_msg2_trap = (mach_msg2_trap_ptr_t)dlsym( dlhandle, "mach_msg2_trap" );
++    if (!mach_msg2_trap)
++        fprintf( stderr, "msync: warning: using mach_msg instead of mach_msg2\n");
++    dlclose( dlhandle );
++
++    MACH_CHECK_ERROR(mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &receive_port), "mach_port_allocate");
++
++    MACH_CHECK_ERROR(mach_port_insert_right(mach_task_self(), receive_port, receive_port, MACH_MSG_TYPE_MAKE_SEND), "mach_port_insert_right");
++
++    limits.mpl_qlimit = 50;
++
++    if (getenv("WINEMSYNC_QLIMIT"))
++        limits.mpl_qlimit = atoi(getenv("WINEMSYNC_QLIMIT"));
++
++    MACH_CHECK_ERROR(mach_port_set_attributes( mach_task_self(), receive_port, MACH_PORT_LIMITS_INFO,
++                                        (mach_port_info_t)&limits, MACH_PORT_LIMITS_INFO_COUNT), "mach_port_set_attributes");
++
++    MACH_CHECK_ERROR(task_get_special_port(mach_task_self(), TASK_BOOTSTRAP_PORT, &bootstrap_port), "task_get_special_port");
++
++    MACH_CHECK_ERROR(bootstrap_register2(bootstrap_port, message_port_name, receive_port, 0), "bootstrap_register2");
++
++    pool_init();
++
++    if (pthread_create( &message_thread, NULL, mach_message_pump, NULL ))
++    {
++        perror("pthread_create");
++        fatal_error( "could not create mach message pump thread\n" );
++    }
++
++    set_thread_policy_qos( pthread_mach_thread_np( message_thread )) ;
++
++    fprintf( stderr, "msync: bootstrapped mach port on %s.\n", message_port_name );
++
++    fprintf( stderr, "msync: up and running.\n" );
++}
++
++static struct list mutex_list = LIST_INIT(mutex_list);
++
++void msync_destroy( struct msync *msync )
++{
++    struct msync_shm *shm = get_shm( msync->shm_idx );
++
++    if (shm->msync_type == MSYNC_MUTEX)
++        list_remove( &msync->mutex_entry );
++    if (!msync->shm_idx) return;
++
++    destroy_all( msync->shm_idx );
++    free( msync );
++}
++
++static void *get_shm( unsigned int idx )
++{
++    int entry  = (idx * 16) / pagesize;
++    int offset = (idx * 16) % pagesize;
++
++    if (entry >= shm_addrs_size)
++    {
++        int new_size = max(shm_addrs_size * 2, entry + 1);
++
++        if (!(shm_addrs = realloc( shm_addrs, new_size * sizeof(shm_addrs[0]) )))
++            fprintf( stderr, "msync: couldn't expand shm_addrs array to size %d\n", entry + 1 );
++
++        memset( shm_addrs + shm_addrs_size, 0, (new_size - shm_addrs_size) * sizeof(shm_addrs[0]) );
++
++        shm_addrs_size = new_size;
++    }
++
++    if (!shm_addrs[entry])
++    {
++        kern_return_t kr;
++        mach_vm_address_t address;
++
++        kr = mach_vm_map( mach_task_self(), (mach_vm_address_t *)&address, (mach_vm_size_t)pagesize, 0, VM_FLAGS_ANYWHERE,
++                          MACH_PORT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_SHARE );
++        MACH_CHECK_ERROR( kr, "mach_vm_map" );
++        memset( (void *)address, 0, pagesize );
++
++        if (debug_level)
++            fprintf( stderr, "msync: Mapping page %d at %llu.\n", entry, address );
++
++        if (__sync_val_compare_and_swap( &shm_addrs[entry], 0, (void *)address ))
++            mach_vm_deallocate( mach_task_self(), address, pagesize ); /* someone beat us to it */
++    }
++
++    return (void *)((unsigned long)shm_addrs[entry] + offset);
++}
++
++static unsigned int msync_alloc_shm( int low, int high, enum msync_type type )
++{
++    unsigned int shm_idx;
++    struct msync_shm *shm;
++
++    shm_idx = min( last_destroyed_idx, last_allocated_idx + 1 );
++
++    for(;;)
++    {
++        shm = get_shm( shm_idx );
++        if (!__atomic_load_n( &shm->refcount, __ATOMIC_SEQ_CST ))
++            break;
++
++        shm_idx++;
++    }
++
++    last_allocated_idx = shm_idx;
++
++    assert(shm);
++    shm->low = low;
++    shm->high = high;
++    shm->msync_type = type;
++    shm->multiple_waiters = 0;
++    __atomic_store_n( &shm->refcount, 1, __ATOMIC_SEQ_CST );
++
++    return shm_idx;
++}
++
++struct msync *create_msync( int low, int high, enum msync_type type )
++{
++    struct msync *msync = mem_alloc( sizeof(struct msync) );
++
++    if (msync)
++    {
++        msync->shm_idx = msync_alloc_shm( low, high, type );
++        if (type == MSYNC_MUTEX)
++            list_add_tail( &mutex_list, &msync->mutex_entry );
++    }
++
++    return msync;
++}
++
++/* shm layout for events or event-like objects. */
++struct msync_event
++{
++    int signaled;
++    int unused;
++    unsigned short msync_type;
++    unsigned short refcount;
++    int multiple_waiters;
++};
++
++void msync_set_event( struct msync *msync )
++{
++    struct msync_event *event = get_shm( msync->shm_idx );
++
++    if (!__atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST ))
++        signal_all( msync->shm_idx, (int *)event );
++}
++
++void msync_reset_event( struct msync *msync )
++{
++    struct msync_event *event = get_shm( msync->shm_idx );
++
++    __atomic_store_n( &event->signaled, 0, __ATOMIC_SEQ_CST );
++}
++
++struct mutex
++{
++    int tid;
++    int count;  /* recursion count */
++    unsigned short msync_type;
++    unsigned short refcount;
++    int multiple_waiters;
++};
++
++void msync_abandon_mutexes( thread_id_t tid )
++{
++    struct msync *msync;
++
++    LIST_FOR_EACH_ENTRY( msync, &mutex_list, struct msync, mutex_entry )
++    {
++        struct mutex *mutex = get_shm( msync->shm_idx );
++
++        if (mutex->tid == tid)
++        {
++            if (debug_level)
++                fprintf( stderr, "msync_abandon_mutexes() idx=%d\n", msync->shm_idx );
++            mutex->tid = ~0;
++            mutex->count = 0;
++            signal_all ( msync->shm_idx, (int *)mutex );
++        }
++    }
++}
++
++void msync_grab_object( struct msync *msync )
++{
++    struct msync_shm *obj = get_shm( msync->shm_idx );
++
++    __atomic_fetch_add( &obj->refcount, 1, __ATOMIC_SEQ_CST );
++}
++
++#else /* __APPLE__ */
++
++int do_msync(void)
++{
++    return 0;
++}
++
++void msync_init_shm(void)
++{
++}
++
++void msync_init(void)
++{
++}
++
++#endif /* __APPLE__ */
+diff --git a/server/msync.h b/server/msync.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..4d834c476b71d64e182f2cf92ef2bfcb64e9dcfa
+--- /dev/null
++++ b/server/msync.h
+@@ -0,0 +1,51 @@
++/*
++ * mach semaphore-based synchronization objects
++ *
++ * Copyright (C) 2018 Zebediah Figura
++ * Copyright (C) 2023 Marc-Aurel Zent
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++extern int do_msync(void);
++extern void msync_init_shm(void);
++extern void msync_init(void);
++
++#ifdef __APPLE__
++
++enum msync_type
++{
++    MSYNC_SEMAPHORE = 1,
++    MSYNC_AUTO_EVENT,
++    MSYNC_MANUAL_EVENT,
++    MSYNC_MUTEX,
++    MSYNC_AUTO_SERVER,
++    MSYNC_MANUAL_SERVER,
++};
++
++struct msync
++{
++    unsigned int    shm_idx;
++    struct list     mutex_entry;
++};
++
++extern struct msync *create_msync( int low, int high, enum msync_type type );
++extern void msync_grab_object( struct msync *msync );
++extern void msync_destroy( struct msync *msync );
++extern void msync_set_event( struct msync *msync );
++extern void msync_reset_event( struct msync *msync );
++extern void msync_abandon_mutexes( thread_id_t tid );
++
++#endif /* __APPLE__ */
+diff --git a/server/protocol.def b/server/protocol.def
+index a9be0a16eb66304d63bb63afaba580139a60b5e2..b3bafe10cc25b137e8e27b05fe2bb20691929a84 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4228,6 +4228,7 @@ enum inproc_sync_type
+ @REPLY
+     int           type;         /* inproc sync type */
+     unsigned int access;        /* handle access rights */
++    unsigned int shm_idx;       /* optional for index-based sync implementations */
+ @END
+ 
+ 
+diff --git a/server/request_handlers.h b/server/request_handlers.h
+index e73242d9bdf9521523f62371a7c7cceb0ce7296e..7e8532f68e1607a7fdbb7342192d1fcba5c2ce30 100644
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -2330,7 +2330,8 @@ C_ASSERT( offsetof(struct get_inproc_sync_fd_request, handle) == 12 );
+ C_ASSERT( sizeof(struct get_inproc_sync_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, type) == 8 );
+ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, access) == 12 );
+-C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 16 );
++C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, shm_idx) == 16 );
++C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 24 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_request) == 16 );
+ C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, handle) == 8 );
+ C_ASSERT( sizeof(struct get_inproc_alert_fd_reply) == 16 );
+diff --git a/server/request_trace.h b/server/request_trace.h
+index 9c7518e7f2e53990aacbdf0be35d7fb236fb1909..23fd232c3244b33c752f35651ab73a65e51c1837 100644
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3411,6 +3411,7 @@ static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply
+ {
+     fprintf( stderr, " type=%d", req->type );
+     fprintf( stderr, ", access=%08x", req->access );
++    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
+ }
+ 
+ static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
+diff --git a/server/thread.c b/server/thread.c
+index bdf48c4bf8fd2859da1e50ed3bf92559767cf9b0..7c16850c649a51a632ddede7f78d699fcfcbe915 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -59,6 +59,7 @@
+ #include "request.h"
+ #include "user.h"
+ #include "security.h"
++#include "msync.h"
+ 
+ 
+ /* thread queues */
+@@ -2382,6 +2383,12 @@ DECL_HANDLER(get_inproc_alert_fd)
+     if ((fd = get_inproc_sync_fd( current->alert_sync )) < 0) set_error( STATUS_INVALID_PARAMETER );
+     else
+     {
++        if (do_msync())
++        {
++            reply->handle = (unsigned int)fd;
++            return;
++        }
++
+         reply->handle = get_thread_id( current ) | 1; /* arbitrary token */
+         send_client_fd( current->process, fd, reply->handle );
+     }
+diff --git a/server/window.c b/server/window.c
+index 3cd82b0c3fd08ef0d3b9f917b3fdf5aca4f691db..f30607b6abf68d1fa40c5e16073fd677739c883e 100644
+--- a/server/window.c
++++ b/server/window.c
+@@ -1251,7 +1251,9 @@ static void set_region_visible_rect( struct region *region, struct window *win )
+ /* get the top-level window to clip against for a given window */
+ static inline struct window *get_top_clipping_window( struct window *win )
+ {
+-    while (!(win->paint_flags & PAINT_HAS_SURFACE) && win->parent && !is_desktop_window(win->parent))
++    while ((!(win->paint_flags & PAINT_HAS_SURFACE) || !win->thread ||
++            win->thread->process != current->process) /* CW HACK 23950 */
++           && win->parent && !is_desktop_window(win->parent))
+         win = win->parent;
+     return win;
+ }

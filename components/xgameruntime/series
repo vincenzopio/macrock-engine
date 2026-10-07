@@ -1,0 +1,23 @@
+# Patch series of the xgameruntime component, applied in this order by `tools/engine import`.
+# Written by `tools/engine export` from the commit order. Topics marked "optional" are applied
+# only with --with <topic> or --all.
+ipc-socket/0001-xodus-Keep-the-IPC-socket-as-a-SOCKET-and-size-its-p.patch
+clang-build/0001-xgameruntime-Include-type_traits-where-XAsync.cpp-us.patch
+async-handler/0001-xgameruntime-Treat-HANDLER_NOT_SET-as-no-completion-.patch
+winrt-mta/0001-xgameruntime-Keep-the-multithreaded-apartment-alive-.patch
+xgame/0001-xgameruntime-Implement-XGame-and-read-the-title-s-Mi.patch
+xfeature/0001-xgameruntime-Implement-XGameRuntimeFeature.patch
+xsystem/0001-xgameruntime-Implement-XSystem-and-XSystemAnalytics.patch
+xerror/0001-xgameruntime-Implement-XError-and-route-XErrorReport.patch
+xnetworking/0001-xgameruntime-Implement-XNetworking.patch
+socket-path/0001-xodus-Connect-to-the-socket-in-XODUS_SOCKET-when-it-.patch
+xodus-protocol/0001-xodus-Name-the-MSA-token-request-s-client-id-ClientI.patch
+xodus-protocol/0002-xodus-Parse-MSA-token-responses-without-leaking-or-t.patch
+xodus-protocol/0003-xodus-Report-the-outcome-of-MSA-token-and-ping-reque.patch
+xodus-protocol/0004-xodus-Receive-whole-frames-and-fail-requests-that-ti.patch
+xodus-protocol/0005-xodus-Keep-each-request-s-reply-alive-and-handle-one.patch
+xodus-protocol/0006-xodus-Wake-the-waiting-request-when-the-service-s-co.patch
+xodus-protocol/0007-xodus-Expose-the-device-ticket-of-MSA-token-response.patch
+xuser/0001-xgameruntime-Implement-XUser-through-the-Xodus-servi.patch
+game-license/0001-xodus-Ask-xodus-service-for-the-account-s-game-licen.patch
+xstore/0001-xgameruntime-Implement-XStore-s-game-license-product.patch

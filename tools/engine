@@ -1,0 +1,625 @@
+#!/usr/bin/python3
+"""engine: the patch queues of macrock-engine.
+
+Every component is an upstream git repository pinned in sources.json plus an ordered series of
+patches in components/<name>/. The patch files are the source of truth; the git tree in
+$ENGINE_WORK/src/<name> (default build.noindex/src/<name>) is generated from them and can be
+thrown away at any time.
+
+  engine import <component> [--all | --with TOPIC... | --without TOPIC...] [--from GITDIR] [--force]
+      Check out the pinned commit (tag engine/base) and apply the series on branch "engine",
+      one commit per patch. Optional topics are applied only with --with or --all. When the
+      tree already matches, nothing is touched, so incremental builds stay incremental.
+  engine export <component>
+      Write the commits engine/base..engine back to components/<component>. The "Topic:"
+      trailer of each commit names its directory. Needs a tree imported with every topic.
+  engine rebase <component> <ref> [--from GITDIR] | --continue | --abort
+      Move the series onto another upstream ref. Conflicts limited to generated files are
+      resolved by regenerating them; the others stop for manual resolution. At the end
+      sources.json gets the new pin and the series is exported.
+  engine status [<component>...]
+
+A component marked "submodules": true in sources.json also gets its submodules checked out, at
+the commits its tree records (they are fetched from their own upstreams; patches cannot modify
+files inside them).
+
+Only Python 3.9 and its standard library are used, so it runs with macOS's /usr/bin/python3.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(os.environ.get("ENGINE_ROOT") or pathlib.Path(__file__).resolve().parent.parent)
+WORK = pathlib.Path(os.environ.get("ENGINE_WORK") or ROOT / "build.noindex")
+BRANCH = "engine"
+BASE_TAG = "engine/base"
+STAMP = "engine-stamp.json"
+REBASE_STATE = "engine-rebase.json"
+TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+SERIES_HEADER = """\
+# Patch series of the {component} component, applied in this order by `tools/engine import`.
+# Written by `tools/engine export` from the commit order. Topics marked "optional" are applied
+# only with --with <topic> or --all.
+"""
+
+# The tool's own git commands ignore the user's global and system configuration, so the
+# commits it creates and the patches it writes depend only on their inputs.
+GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_COMMITTER_NAME": "macrock-engine",
+    "GIT_COMMITTER_EMAIL": "engine@macrock.invalid",
+    "GIT_EDITOR": "true",
+    "GIT_PAGER": "cat",
+    "LC_ALL": "C",
+}
+
+
+class Error(Exception):
+    pass
+
+
+def info(message: str) -> None:
+    print("==> " + message, flush=True)
+
+
+def git(tree: pathlib.Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env.update(GIT_ENV)
+    proc = subprocess.run(["git", "-C", str(tree), *args], env=env, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and proc.returncode != 0:
+        output = (proc.stderr + proc.stdout).strip()
+        raise Error("git {} failed:\n{}".format(" ".join(args), output))
+    return proc
+
+
+def git_out(tree: pathlib.Path, *args: str) -> str:
+    return git(tree, *args).stdout.strip()
+
+
+# --- sources.json and the series --------------------------------------------------------------
+
+def load_sources() -> dict:
+    path = ROOT / "sources.json"
+    try:
+        sources = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise Error("{} not found".format(path))
+    if sources.get("schema") != 1:
+        raise Error("sources.json: unsupported schema")
+    return sources
+
+
+def save_sources(sources: dict) -> None:
+    (ROOT / "sources.json").write_text(json.dumps(sources, indent=2) + "\n")
+
+
+def load_pin(component: str) -> dict:
+    pin = load_sources()["components"].get(component)
+    if pin is None:
+        raise Error("unknown component {!r} (see sources.json)".format(component))
+    for key in ("url", "ref", "commit"):
+        if not pin.get(key):
+            raise Error("sources.json: {} has no {}".format(component, key))
+    if not re.fullmatch(r"[0-9a-f]{40}", pin["commit"]):
+        raise Error("sources.json: {}.commit must be a full SHA-1".format(component))
+    return pin
+
+
+class Entry:
+    def __init__(self, topic: str, name: str, optional: bool):
+        self.topic, self.name, self.optional = topic, name, optional
+
+    @property
+    def path(self) -> str:
+        return "{}/{}".format(self.topic, self.name)
+
+
+def component_dir(component: str) -> pathlib.Path:
+    return ROOT / "components" / component
+
+
+def read_series(component: str) -> list[Entry]:
+    path = component_dir(component) / "series"
+    if not path.exists():
+        return []
+    entries, optional_of = [], {}
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        fields = line.split("#", 1)[0].split()
+        if not fields:
+            continue
+        where = "{}:{}".format(path, number)
+        topic, slash, name = fields[0].partition("/")
+        if not slash or "/" in name or not name.endswith(".patch") or not TOPIC_RE.match(topic):
+            raise Error("{}: expected <topic>/<name>.patch, got {!r}".format(where, fields[0]))
+        if any(flag != "optional" for flag in fields[1:]):
+            raise Error("{}: unknown flag in {!r}".format(where, line))
+        optional = "optional" in fields[1:]
+        if optional_of.setdefault(topic, optional) != optional:
+            raise Error("{}: topic {} is optional on some lines only".format(where, topic))
+        if not (component_dir(component) / "patches" / topic / name).is_file():
+            raise Error("{}: patches/{}/{} not found".format(where, topic, name))
+        entries.append(Entry(topic, name, optional))
+    return entries
+
+
+def topics_of(entries: list[Entry]) -> list[str]:
+    return list(dict.fromkeys(entry.topic for entry in entries))
+
+
+def select(entries: list[Entry], with_topics: list[str], without_topics: list[str],
+           everything: bool) -> tuple[list[Entry], list[str]]:
+    topics = topics_of(entries)
+    unknown = sorted(set(with_topics + without_topics) - set(topics))
+    if unknown:
+        raise Error("unknown topic(s): {}".format(", ".join(unknown)))
+    optional = {entry.topic for entry in entries if entry.optional}
+    chosen = {topic for topic in topics
+              if (everything or topic not in optional or topic in with_topics)
+              and topic not in without_topics}
+    return [entry for entry in entries if entry.topic in chosen], [t for t in topics if t not in chosen]
+
+
+def series_digest(component: str, commit: str, entries: list[Entry]) -> str:
+    digest = hashlib.sha256("commit {}\n".format(commit).encode())
+    for entry in entries:
+        content = (component_dir(component) / "patches" / entry.path).read_bytes()
+        digest.update("{} {}\n".format(entry.path, hashlib.sha256(content).hexdigest()).encode())
+    return digest.hexdigest()
+
+
+# --- the generated tree -----------------------------------------------------------------------
+
+def tree_of(component: str) -> pathlib.Path:
+    return WORK / "src" / component
+
+
+def git_dir(tree: pathlib.Path) -> pathlib.Path:
+    return tree / ".git"
+
+
+def read_json(path: pathlib.Path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+
+
+def write_json(path: pathlib.Path, value) -> None:
+    path.write_text(json.dumps(value, indent=1, sort_keys=True) + "\n")
+
+
+def read_stamp(tree: pathlib.Path):
+    return read_json(git_dir(tree) / STAMP)
+
+
+ALL_TOPICS = {"with": [], "without": [], "all": True}
+
+
+def write_stamp(tree: pathlib.Path, digest: str, selection: dict, excluded: list[str]) -> None:
+    """Record what the tree was generated from: series digest, resulting HEAD, topic selection."""
+    write_json(git_dir(tree) / STAMP, {"digest": digest, "head": head_of(tree),
+                                       "selection": selection, "excluded": excluded})
+
+
+def head_of(tree: pathlib.Path):
+    return resolve(tree, "HEAD")
+
+
+def resolve(tree: pathlib.Path, rev: str):
+    proc = git(tree, "rev-parse", "--verify", "--quiet", rev + "^{commit}", check=False)
+    return proc.stdout.strip() or None
+
+
+def operation_in_progress(tree: pathlib.Path):
+    gd = git_dir(tree)
+    if (gd / "rebase-merge").exists() or (gd / "rebase-apply" / "rebasing").exists():
+        return "rebase"
+    if (gd / "rebase-apply").exists():
+        return "am"
+    for name, what in (("CHERRY_PICK_HEAD", "cherry-pick"), ("MERGE_HEAD", "merge"),
+                       ("REVERT_HEAD", "revert")):
+        if (gd / name).exists():
+            return what
+    return None
+
+
+def is_dirty(tree: pathlib.Path) -> bool:
+    return bool(git_out(tree, "status", "--porcelain"))
+
+
+def on_branch(tree: pathlib.Path) -> bool:
+    proc = git(tree, "symbolic-ref", "--quiet", "HEAD", check=False)
+    return proc.stdout.strip() == "refs/heads/" + BRANCH
+
+
+def unexported(tree: pathlib.Path, stamp) -> str:
+    """Why the tree may hold work that is not in the patch files, or "" when it does not."""
+    head = head_of(tree)
+    if stamp is None:
+        return "it was not created by `engine import`" if head else ""
+    if head == stamp["head"]:
+        return ""
+    if stamp["head"] and git(tree, "merge-base", "--is-ancestor", stamp["head"], "HEAD",
+                             check=False).returncode == 0:
+        count = git_out(tree, "rev-list", "--count", stamp["head"] + "..HEAD")
+        return "{} commit(s) after the last import/export are not exported".format(count)
+    return "HEAD moved since the last import/export"
+
+
+def check_unchanged_work(tree: pathlib.Path, component: str, force: bool) -> None:
+    problems = []
+    operation = operation_in_progress(tree)
+    if operation:
+        problems.append("a git {} is in progress".format(operation))
+    if is_dirty(tree):
+        problems.append("the tree has uncommitted changes")
+    reason = unexported(tree, read_stamp(tree))
+    if reason:
+        problems.append(reason)
+    if problems and not force:
+        raise Error("{}: {}.\nRun `engine export {}` (or use --force to discard).".format(
+            tree, "; ".join(problems), component))
+
+
+def fetch_commit(tree: pathlib.Path, url: str, ref: str, commit, source) -> str:
+    """Make ref (or the given commit) available in tree; return the commit it resolves to."""
+    origin = str(source) if source else url
+    if commit:
+        if resolve(tree, commit):
+            return commit
+        # The pin is the commit, not the ref (a branch or pull request head moves on): fetch it
+        # directly, which GitHub and local repositories allow for any reachable commit.
+        info("Fetching {} from {}".format(commit[:12], origin))
+        git(tree, "fetch", "--quiet", "--no-tags", "--depth=1", origin, commit, check=False)
+        if resolve(tree, commit):
+            return commit
+    info("Fetching {} from {}".format(ref, origin))
+    proc = git(tree, "fetch", "--quiet", "--no-tags", "--depth=1", origin, ref, check=False)
+    if proc.returncode != 0:
+        raise Error("cannot fetch {} from {}:\n{}".format(ref, origin, proc.stderr.strip()))
+    fetched = resolve(tree, "FETCH_HEAD")
+    if commit and fetched != commit:
+        raise Error("{} now resolves to {}, and the pinned {} cannot be fetched from {}".format(
+            ref, fetched, commit, origin))
+    return fetched
+
+
+# --- commands ---------------------------------------------------------------------------------
+
+def cmd_import(component: str, with_topics: list[str], without_topics: list[str], everything: bool,
+               source, force: bool) -> None:
+    pin = load_pin(component)
+    selected, excluded = select(read_series(component), with_topics, without_topics, everything)
+    selection = {"with": sorted(with_topics), "without": sorted(without_topics), "all": everything}
+    digest = series_digest(component, pin["commit"], selected)
+    tree = tree_of(component)
+
+    if git_dir(tree).is_dir():
+        stamp = read_stamp(tree)
+        if (stamp and stamp["digest"] == digest and stamp["head"] == head_of(tree)
+                and on_branch(tree) and not operation_in_progress(tree) and not is_dirty(tree)):
+            info("{}: unchanged ({} patches on {})".format(component, len(selected), pin["ref"]))
+            return
+        check_unchanged_work(tree, component, force)
+        operation = operation_in_progress(tree)
+        if operation:
+            git(tree, operation, "--abort", check=False)
+        (git_dir(tree) / REBASE_STATE).unlink(missing_ok=True)
+    else:
+        tree.mkdir(parents=True, exist_ok=True)
+        git(tree, "init", "--quiet")
+
+    fetch_commit(tree, pin["url"], pin["ref"], pin["commit"], source)
+    git(tree, "checkout", "--quiet", "--force", "-B", BRANCH, pin["commit"])
+    git(tree, "clean", "--quiet", "-fd")
+    git(tree, "tag", "--force", BASE_TAG, pin["commit"])
+    update_submodules(tree, pin)
+    for entry in selected:
+        patch = component_dir(component) / "patches" / entry.path
+        proc = git(tree, "am", "--quiet", "--3way", "--keep-cr", "--committer-date-is-author-date",
+                   str(patch), check=False)
+        if proc.returncode != 0:
+            output = (proc.stdout + proc.stderr).strip()
+            git(tree, "am", "--abort", check=False)
+            write_stamp(tree, "", selection, excluded)
+            raise Error("{}: {} does not apply on {}:\n{}".format(component, entry.path, pin["ref"], output))
+        topic = topic_of(tree, "HEAD")
+        if topic != entry.topic:
+            write_stamp(tree, "", selection, excluded)
+            raise Error("{}: {} has trailer Topic: {}, expected {}".format(
+                component, entry.path, topic, entry.topic))
+    write_stamp(tree, digest, selection, excluded)
+    message = "{}: {} patches on {} ({})".format(component, len(selected), pin["ref"], pin["commit"][:12])
+    if excluded:
+        message += ", without " + ", ".join(excluded)
+    info(message + " -> " + str(tree))
+
+
+def update_submodules(tree: pathlib.Path, pin: dict) -> None:
+    """Check out the submodule commits recorded in the tree, for components that have some."""
+    if not pin.get("submodules"):
+        return
+    proc = git(tree, "submodule", "update", "--init", "--recursive", "--force", "--depth=1", check=False)
+    if proc.returncode != 0:
+        raise Error("{}: cannot check out its submodules:\n{}".format(tree, (proc.stdout + proc.stderr).strip()))
+
+
+def topic_of(tree: pathlib.Path, rev: str):
+    values = git_out(tree, "log", "-1", "--format=%(trailers:key=Topic,valueonly,separator=%x00)", rev)
+    topics = [value.strip() for value in values.split("\0") if value.strip()]
+    return topics[0] if len(topics) == 1 else None
+
+
+def require_exportable(tree: pathlib.Path, component: str, pin: dict) -> None:
+    if not git_dir(tree).is_dir():
+        raise Error("{}: no tree at {}; run `engine import {} --all`".format(component, tree, component))
+    operation = operation_in_progress(tree)
+    if operation:
+        raise Error("{}: a git {} is in progress".format(component, operation))
+    if is_dirty(tree):
+        raise Error("{}: commit or discard the changes in {} first".format(component, tree))
+    stamp = read_stamp(tree)
+    if stamp is None:
+        raise Error("{}: {} was not created by `engine import`".format(component, tree))
+    if stamp["excluded"]:
+        raise Error("{}: the tree was imported without {}, so exporting would drop them; work in a "
+                    "tree from `engine import {} --all`".format(
+                        component, ", ".join(stamp["excluded"]), component))
+    if not on_branch(tree):
+        raise Error("{}: {} is not on branch {}".format(component, tree, BRANCH))
+    if resolve(tree, BASE_TAG) != pin["commit"]:
+        raise Error("{}: tag {} is not the pinned commit {}".format(component, BASE_TAG, pin["commit"][:12]))
+
+
+def cmd_export(component: str) -> None:
+    pin = load_pin(component)
+    tree = tree_of(component)
+    require_exportable(tree, component, pin)
+    if git_out(tree, "rev-list", "--merges", BASE_TAG + "..HEAD"):
+        raise Error("{}: merge commits cannot be exported; rebase them away".format(component))
+    commits = git_out(tree, "rev-list", "--reverse", BASE_TAG + "..HEAD").split()
+    topics, missing = [], []
+    for commit in commits:
+        topic = topic_of(tree, commit)
+        if topic is None or not TOPIC_RE.match(topic):
+            missing.append(git_out(tree, "log", "-1", "--format=%h %s", commit))
+        topics.append(topic)
+    if missing:
+        raise Error("{}: these commits need exactly one valid \"Topic: <name>\" trailer "
+                    "(git commit --amend --trailer \"Topic: <name>\"):\n  {}".format(
+                        component, "\n  ".join(missing)))
+
+    optional = {entry.topic for entry in read_series(component) if entry.optional}
+    directory = component_dir(component)
+    directory.mkdir(parents=True, exist_ok=True)
+    staging = pathlib.Path(tempfile.mkdtemp(prefix="patches.", dir=directory))
+    try:
+        entries, counters = [], collections.Counter()
+        for commit, topic in zip(commits, topics):
+            counters[topic] += 1
+            written = git_out(tree, "format-patch", "-1", commit, "--zero-commit", "--no-signature",
+                              "--no-numbered", "--full-index", "--start-number", str(counters[topic]),
+                              "-o", str(staging / topic))
+            entries.append(Entry(topic, pathlib.Path(written).name, topic in optional))
+        shutil.rmtree(directory / "patches", ignore_errors=True)
+        staging.rename(directory / "patches")
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    lines = [entry.path + (" optional" if entry.optional else "") for entry in entries]
+    (directory / "series").write_text(SERIES_HEADER.format(component=component) + "".join(
+        line + "\n" for line in lines))
+    write_stamp(tree, series_digest(component, pin["commit"], entries), ALL_TOPICS, [])
+    counts = ", ".join("{} ({})".format(topic, counters[topic]) for topic in topics_of(entries))
+    info("{}: exported {} patches: {}".format(component, len(entries), counts or "none"))
+
+
+def subjects(tree: pathlib.Path, revisions: str) -> list[str]:
+    return git_out(tree, "log", "--reverse", "--format=%s", revisions).splitlines()
+
+
+def regenerate(tree: pathlib.Path, pin: dict, conflicted: list[str]) -> bool:
+    """Resolve conflicts limited to generated files by regenerating them on top of upstream's.
+
+    A pin's "regenerate" lists rules, {"command": [...], "files": [...]}; the rules whose files
+    conflict run, in order."""
+    rules = pin.get("regenerate", [])
+    generated = {name for rule in rules for name in rule["files"]}
+    if not conflicted or not set(conflicted) <= generated:
+        return False
+    git(tree, "checkout", "--ours", "--", *conflicted)
+    for rule in rules:
+        if not set(conflicted) & set(rule["files"]):
+            continue
+        info("Regenerating {} with {}".format(", ".join(f for f in conflicted if f in rule["files"]),
+                                              " ".join(rule["command"])))
+        proc = subprocess.run(rule["command"], cwd=str(tree), text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if proc.returncode != 0:
+            raise Error("{} failed:\n{}".format(" ".join(rule["command"]), proc.stdout.strip()))
+        git(tree, "add", "--", *rule["files"])
+    return True
+
+
+def cmd_rebase(component: str, ref, source, proceed: bool, abort: bool) -> None:
+    pin = load_pin(component)
+    tree = tree_of(component)
+    state_path = git_dir(tree) / REBASE_STATE
+    state = read_json(state_path) if git_dir(tree).is_dir() else None
+
+    if abort:
+        if operation_in_progress(tree) == "rebase":
+            git(tree, "rebase", "--abort")
+        state_path.unlink(missing_ok=True)
+        info("{}: rebase aborted".format(component))
+        return
+    if proceed:
+        if state is None:
+            raise Error("{}: no engine rebase in progress".format(component))
+        if operation_in_progress(tree) == "rebase":
+            proc = git(tree, "rebase", "--continue", check=False)
+        else:
+            proc = None
+    else:
+        if state is not None:
+            raise Error("{}: a rebase is already in progress; use --continue or --abort".format(component))
+        require_exportable(tree, component, pin)
+        reason = unexported(tree, read_stamp(tree))
+        if reason:
+            raise Error("{}: {}; run `engine export {}` first".format(component, reason, component))
+        commit = fetch_commit(tree, pin["url"], ref, None, source)
+        if commit == pin["commit"]:
+            info("{}: {} is already the pinned commit".format(component, ref))
+            return
+        state = {"ref": ref, "commit": commit, "subjects": subjects(tree, BASE_TAG + "..HEAD")}
+        write_json(state_path, state)
+        info("{}: rebasing {} patches from {} onto {} ({})".format(
+            component, len(state["subjects"]), pin["ref"], ref, commit[:12]))
+        proc = git(tree, "rebase", "--quiet", "--committer-date-is-author-date", "--empty=drop",
+                   "--onto", commit, BASE_TAG, BRANCH, check=False)
+
+    while operation_in_progress(tree) == "rebase":
+        conflicted = git_out(tree, "diff", "--name-only", "--diff-filter=U").split()
+        if regenerate(tree, pin, conflicted):
+            proc = git(tree, "rebase", "--continue", check=False)
+            continue
+        stopped = git_out(tree, "log", "-1", "--format=%h %s", "REBASE_HEAD") if resolve(
+            tree, "REBASE_HEAD") else "?"
+        details = "conflicts in:\n  " + "\n  ".join(conflicted) if conflicted else (
+            (proc.stdout + proc.stderr).strip() if proc else "")
+        raise Error("{}: rebase stopped at {}; {}\nResolve in {}, then `engine rebase {} --continue` "
+                    "(or --abort).".format(component, stopped, details, tree, component))
+    if proc is not None and proc.returncode != 0:
+        raise Error("{}: rebase failed:\n{}".format(component, (proc.stdout + proc.stderr).strip()))
+
+    after = subjects(tree, state["commit"] + "..HEAD")
+    remaining = list(after)
+    dropped = []
+    for subject in state["subjects"]:
+        if subject in remaining:
+            remaining.remove(subject)
+        else:
+            dropped.append(subject)
+    git(tree, "tag", "--force", BASE_TAG, state["commit"])
+    update_submodules(tree, pin)
+    sources = load_sources()
+    sources["components"][component]["ref"] = state["ref"]
+    sources["components"][component]["commit"] = state["commit"]
+    save_sources(sources)
+    write_stamp(tree, "", ALL_TOPICS, [])
+    state_path.unlink()
+    cmd_export(component)
+    info("{}: now on {} ({})".format(component, state["ref"], state["commit"][:12]))
+    for subject in dropped:
+        info("dropped: {} (it became empty, usually because upstream has it, or was skipped)".format(subject))
+
+
+def cmd_status(components: list[str]) -> None:
+    sources = load_sources()
+    for component in components or list(sources["components"]):
+        pin = load_pin(component)
+        entries = read_series(component)
+        optional = {entry.topic for entry in entries if entry.optional}
+        counts = collections.Counter(entry.topic for entry in entries)
+        print("{}: {} {} ({})".format(component, pin["url"], pin["ref"], pin["commit"][:12]))
+        print("  topics: " + (", ".join("{} ({}{})".format(topic, count, ", optional" if topic in optional else "")
+                                       for topic, count in counts.items()) or "none"))
+        tree = tree_of(component)
+        if not git_dir(tree).is_dir():
+            print("  tree: not imported")
+            continue
+        notes = []
+        operation = operation_in_progress(tree)
+        if operation:
+            notes.append("git {} in progress".format(operation))
+        if (git_dir(tree) / REBASE_STATE).exists():
+            notes.append("engine rebase in progress")
+        if is_dirty(tree):
+            notes.append("uncommitted changes")
+        stamp = read_stamp(tree)
+        reason = unexported(tree, stamp)
+        if reason:
+            notes.append(reason)
+        elif stamp:
+            selection = stamp["selection"]
+            try:
+                selected, _ = select(entries, selection["with"], selection["without"], selection["all"])
+                current = series_digest(component, pin["commit"], selected)
+            except Error:
+                current = None
+            if not stamp["digest"]:
+                notes.append("the last import or rebase did not finish")
+            elif stamp["digest"] != current:
+                notes.append("the series or the pin changed since the import")
+            if stamp["excluded"]:
+                notes.append("imported without " + ", ".join(stamp["excluded"]))
+        print("  tree: {} ({})".format(tree, "; ".join(notes) if notes else "matches the series"))
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="engine", description=__doc__.split("\n\n")[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    p = commands.add_parser("import", help="generate the git tree of a component from its series")
+    p.add_argument("component")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--all", action="store_true", help="apply every topic, optional ones included")
+    group.add_argument("--with", dest="with_topics", action="append", default=[], metavar="TOPIC",
+                       help="also apply this optional topic")
+    p.add_argument("--without", dest="without_topics", action="append", default=[], metavar="TOPIC",
+                   help="leave this topic out")
+    p.add_argument("--from", dest="source", type=pathlib.Path, metavar="GITDIR",
+                   help="take the pinned commit from this local repository")
+    p.add_argument("--force", action="store_true", help="discard unexported work in the tree")
+
+    p = commands.add_parser("export", help="write the tree's commits back to the series")
+    p.add_argument("component")
+
+    p = commands.add_parser("rebase", help="move the series onto another upstream ref")
+    p.add_argument("component")
+    p.add_argument("ref", nargs="?")
+    p.add_argument("--from", dest="source", type=pathlib.Path, metavar="GITDIR")
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--continue", dest="proceed", action="store_true")
+    group.add_argument("--abort", action="store_true")
+
+    p = commands.add_parser("status", help="show pins, topics and the state of the trees")
+    p.add_argument("components", nargs="*")
+
+    args = parser.parse_args(argv)
+    if getattr(args, "source", None):
+        args.source = args.source.resolve()  # git runs inside the generated tree
+    try:
+        if args.command == "import":
+            if args.all and args.without_topics:
+                raise Error("--all and --without cannot be combined")
+            cmd_import(args.component, args.with_topics, args.without_topics, args.all, args.source,
+                       args.force)
+        elif args.command == "export":
+            cmd_export(args.component)
+        elif args.command == "rebase":
+            if bool(args.ref) == (args.proceed or args.abort):
+                raise Error("give either a ref or --continue/--abort")
+            cmd_rebase(args.component, args.ref, args.source, args.proceed, args.abort)
+        else:
+            cmd_status(args.components)
+    except Error as error:
+        print("error: {}".format(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
