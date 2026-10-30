@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michal=20Vav=C5=99i=C5=88=C3=A1k?= <vavrinakm@gmail.com>
+Date: Wed, 28 Oct 2026 15:42:16 +0100
+Subject: [PATCH] xbox: support compact JWE delegation tickets.
+
+Microsoft sign-in succeeds, but Xbox rejects some accounts' new compact JWE delegation tickets
+with HTTP 400 when they carry the d= prefix. macrock then reports "Microsoft didn't answer".
+Use t= for these tickets in the Xbox authentication request. Opaque tickets keep d=, and the
+conversion leaves requests to other services alone. A test covers both ticket formats.
+
+Sign-in and Minecraft launch tested on an M1 Max MacBook Pro running macOS 27.
+
+Based on the ticket handling in https://github.com/domsvoboda/xodus-nexus/pull/414
+(GPL-3.0-only, as Xodus).
+
+Topic: xbox-ticket
+---
+ crates/xodus/src/api/xbox/auth.rs | 60 ++++++++++++++++++++++++++++++-
+ 1 file changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/crates/xodus/src/api/xbox/auth.rs b/crates/xodus/src/api/xbox/auth.rs
+index bf2aa0eda8fc91a184cbb91328089aee4a8ef269..d6d4dd8738d0b5082e312a2a706fddd70da2dac2 100644
+--- a/crates/xodus/src/api/xbox/auth.rs
++++ b/crates/xodus/src/api/xbox/auth.rs
+@@ -12,7 +12,7 @@ pub async fn authenticate_xbox_user(
+         properties: UserAuthProperties {
+             auth_method: "RPS".to_string(),
+             site_name: "user.auth.xboxlive.com".to_string(),
+-            rps_ticket,
++            rps_ticket: xbox_ticket(rps_ticket),
+         },
+     };
+ 
+@@ -28,6 +28,64 @@ pub async fn authenticate_xbox_user(
+     resp.json().await
+ }
+ 
++// Xbox expects compact JWE delegation tickets as t=, but opaque tickets as d=.
++fn xbox_ticket(ticket: String) -> String {
++    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
++    let Some(value) = ticket.strip_prefix("d=") else {
++        return ticket;
++    };
++    let parts: Vec<_> = value.split('.').collect();
++    if parts.len() != 5
++        || parts[0].is_empty()
++        || parts[0].len() > 8192
++        || parts[2..].iter().any(|part| part.is_empty())
++        || !parts.iter().all(|part| {
++            part.len() % 4 != 1
++                && part
++                    .bytes()
++                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
++        })
++    {
++        return ticket;
++    }
++    let valid_header = URL_SAFE_NO_PAD
++        .decode(parts[0])
++        .ok()
++        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
++        .is_some_and(|header| {
++            ["alg", "enc"].iter().all(|key| {
++                header
++                    .get(key)
++                    .and_then(|value| value.as_str())
++                    .is_some_and(|value| !value.is_empty())
++            })
++        });
++    if valid_header {
++        format!("t={value}")
++    } else {
++        ticket
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::xbox_ticket;
++
++    #[test]
++    fn only_compact_jwe_delegation_tickets_change_prefix() {
++        let jwe = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..aXY.Y2lwaGVy.dGFn";
++        assert_eq!(xbox_ticket(format!("d={jwe}")), format!("t={jwe}"));
++        for ticket in [
++            "d=opaque",
++            "d=one.two.three",
++            "d=one.two.three.four.five",
++            "t=opaque",
++        ] {
++            assert_eq!(xbox_ticket(ticket.to_owned()), ticket);
++        }
++    }
++}
++
+ pub async fn request_xsts_token(
+     client: &reqwest::Client,
+     token: String,

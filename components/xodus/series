@@ -19,3 +19,4 @@ install/0003-licensing-get-the-key-of-a-package-s-content-without.patch
 install/0004-service-install-the-game-for-the-launcher.patch
 install/0005-msixvc-extract-a-Preview-package-s-executable-which-.patch
 game-license/0002-service-log-why-the-licensing-service-refuses-a-game.patch
+xbox-ticket/0001-xbox-support-compact-JWE-delegation-tickets.patch
