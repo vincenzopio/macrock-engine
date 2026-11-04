@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: vincenzopio <43883474+vincenzopio@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 14:41:08 +0100
+Subject: [PATCH] licensing: send compact JWE delegation tickets to the
+ licensing service as t=.
+
+The licensing service, like Xbox, rejects a compact JWE delegation ticket in the d= form: the
+licenses/content request then fails with HTTP 401, after sign-in and the package lookup succeed.
+The conversion Xbox's user authentication uses moves to models::secrets, and the device's and the
+user's tickets for the licensing service go through it too. Opaque tickets keep d=.
+
+Reported in https://github.com/xodus-gaming/xodus/issues/238: with both tickets as t=, the
+content license request succeeds.
+
+Original work for macrock (GPL-3.0-only, as Xodus).
+
+Topic: xbox-ticket
+---
+ crates/xodus/src/api/xbox/auth.rs  | 61 +-----------------------------
+ crates/xodus/src/licensing/game.rs |  4 +-
+ crates/xodus/src/models/secrets.rs | 59 +++++++++++++++++++++++++++++
+ 3 files changed, 63 insertions(+), 61 deletions(-)
+
+diff --git a/crates/xodus/src/api/xbox/auth.rs b/crates/xodus/src/api/xbox/auth.rs
+index d6d4dd8738d0b5082e312a2a706fddd70da2dac2..e9788b52ebf1246a8750c4899fab5c76cb26e3c5 100644
+--- a/crates/xodus/src/api/xbox/auth.rs
++++ b/crates/xodus/src/api/xbox/auth.rs
+@@ -1,3 +1,4 @@
++use crate::models::secrets::delegation_ticket;
+ use crate::models::xbox::{
+     UserAuthProperties, UserAuthRequest, XstsPropertyBag, XstsRequest, XstsResponse,
+ };
+@@ -12,7 +13,7 @@ pub async fn authenticate_xbox_user(
+         properties: UserAuthProperties {
+             auth_method: "RPS".to_string(),
+             site_name: "user.auth.xboxlive.com".to_string(),
+-            rps_ticket: xbox_ticket(rps_ticket),
++            rps_ticket: delegation_ticket(rps_ticket),
+         },
+     };
+ 
+@@ -28,64 +29,6 @@ pub async fn authenticate_xbox_user(
+     resp.json().await
+ }
+ 
+-// Xbox expects compact JWE delegation tickets as t=, but opaque tickets as d=.
+-fn xbox_ticket(ticket: String) -> String {
+-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+-    let Some(value) = ticket.strip_prefix("d=") else {
+-        return ticket;
+-    };
+-    let parts: Vec<_> = value.split('.').collect();
+-    if parts.len() != 5
+-        || parts[0].is_empty()
+-        || parts[0].len() > 8192
+-        || parts[2..].iter().any(|part| part.is_empty())
+-        || !parts.iter().all(|part| {
+-            part.len() % 4 != 1
+-                && part
+-                    .bytes()
+-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+-        })
+-    {
+-        return ticket;
+-    }
+-    let valid_header = URL_SAFE_NO_PAD
+-        .decode(parts[0])
+-        .ok()
+-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+-        .is_some_and(|header| {
+-            ["alg", "enc"].iter().all(|key| {
+-                header
+-                    .get(key)
+-                    .and_then(|value| value.as_str())
+-                    .is_some_and(|value| !value.is_empty())
+-            })
+-        });
+-    if valid_header {
+-        format!("t={value}")
+-    } else {
+-        ticket
+-    }
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::xbox_ticket;
+-
+-    #[test]
+-    fn only_compact_jwe_delegation_tickets_change_prefix() {
+-        let jwe = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..aXY.Y2lwaGVy.dGFn";
+-        assert_eq!(xbox_ticket(format!("d={jwe}")), format!("t={jwe}"));
+-        for ticket in [
+-            "d=opaque",
+-            "d=one.two.three",
+-            "d=one.two.three.four.five",
+-            "t=opaque",
+-        ] {
+-            assert_eq!(xbox_ticket(ticket.to_owned()), ticket);
+-        }
+-    }
+-}
+-
+ pub async fn request_xsts_token(
+     client: &reqwest::Client,
+     token: String,
+diff --git a/crates/xodus/src/licensing/game.rs b/crates/xodus/src/licensing/game.rs
+index 4577a47df990ca85adcda8c4efce6d53596a6e9d..8dc5afd89860c162b47a2a6df8eae99640f22682 100644
+--- a/crates/xodus/src/licensing/game.rs
++++ b/crates/xodus/src/licensing/game.rs
+@@ -7,7 +7,7 @@ use crate::api::displaycatalog::find_products_by_id;
+ use crate::api::live::{exchange_device_token, exchange_user_token};
+ use crate::licensing::content::{LicenseContentError, get_license_content};
+ use crate::models::live::ExchangeUserTokenOutcome;
+-use crate::models::secrets::Token;
++use crate::models::secrets::{Token, delegation_ticket};
+ use crate::models::soap;
+ use crate::tokens::TokenManager;
+ 
+@@ -142,5 +142,5 @@ pub(crate) async fn licensing_tokens(
+     let Token::Compact(user_token) = user_token else {
+         return Err(failed("unexpected user token"));
+     };
+-    Ok((device_token, user_token, user.puid))
++    Ok((delegation_ticket(device_token), delegation_ticket(user_token), user.puid))
+ }
+diff --git a/crates/xodus/src/models/secrets.rs b/crates/xodus/src/models/secrets.rs
+index 3a6268cbaedf6a1dca7d128b3848fe15d6e1d127..75018d7f78ee056ea398f931d3368cfde407bfd6 100644
+--- a/crates/xodus/src/models/secrets.rs
++++ b/crates/xodus/src/models/secrets.rs
+@@ -82,3 +82,62 @@ pub struct User {
+     pub puid: String,
+     pub username: String,
+ }
++
++/// The form Xbox and the licensing service expect of a delegation ticket: t= for a compact JWE
++/// ticket, d= for an opaque one.
++pub(crate) fn delegation_ticket(ticket: String) -> String {
++    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
++    let Some(value) = ticket.strip_prefix("d=") else {
++        return ticket;
++    };
++    let parts: Vec<_> = value.split('.').collect();
++    if parts.len() != 5
++        || parts[0].is_empty()
++        || parts[0].len() > 8192
++        || parts[2..].iter().any(|part| part.is_empty())
++        || !parts.iter().all(|part| {
++            part.len() % 4 != 1
++                && part
++                    .bytes()
++                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
++        })
++    {
++        return ticket;
++    }
++    let valid_header = URL_SAFE_NO_PAD
++        .decode(parts[0])
++        .ok()
++        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
++        .is_some_and(|header| {
++            ["alg", "enc"].iter().all(|key| {
++                header
++                    .get(key)
++                    .and_then(|value| value.as_str())
++                    .is_some_and(|value| !value.is_empty())
++            })
++        });
++    if valid_header {
++        format!("t={value}")
++    } else {
++        ticket
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::delegation_ticket;
++
++    #[test]
++    fn only_compact_jwe_delegation_tickets_change_prefix() {
++        let jwe = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..aXY.Y2lwaGVy.dGFn";
++        assert_eq!(delegation_ticket(format!("d={jwe}")), format!("t={jwe}"));
++        for ticket in [
++            "d=opaque",
++            "d=one.two.three",
++            "d=one.two.three.four.five",
++            "t=opaque",
++        ] {
++            assert_eq!(delegation_ticket(ticket.to_owned()), ticket);
++        }
++    }
++}
